@@ -23,12 +23,16 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Tells apart who said what in group conversations
 - Reads photos, documents, voice notes, and audio
 - Understands plain requests with no command — say "make me a report" and it attaches the file, or "draw a logo" and it makes the image
+- Knows what it just did: command replies go into the chat transcript, so a follow-up like "iska matlab kya hai?" still has the `/research` result in front of it
+- Says so plainly when a link could not be read, instead of describing a page it never saw
 - Sets reminders and delivers them on time ("remind me in 2h to call mom"), with no external service
 - Reads a link you paste and answers about the page — news, blogs and social links
 - Reads social **posts**, not just their preview card, using public endpoints only (no API
   key, no login, no app registration): X/Twitter, Reddit (post + top comments), Mastodon,
   Bluesky (post + replies), TikTok, and public Telegram channels. Instagram, Facebook and
   LinkedIn fall back to their Open Graph data, which is all they publish
+- Reads a **GitHub** link for real — repository metadata, the top-level file list, the
+  README, or a single file's raw contents — instead of the "Contribute to …" card
 - `/skills` prints exactly what it can and cannot do — generated from the same table the
   persona prompt uses, so the answer can never drift from the code
 - YouTube links too: title, channel, description and public captions — no browser, no key
@@ -188,12 +192,19 @@ not rediscover it the hard way.
   could in principle answer public for our check and private for the connection. Pinning the
   connection to the validated IP was considered and rejected: it bypasses the egress proxy that
   many hosts (and most corporate networks) require, which would break every fetch. The impact
-  is limited because the bot reaches no internal services.
+  is limited because the bot reaches no internal services. When the process cannot resolve
+  names itself at all (a proxy doing the DNS, a container with no resolver) the host check
+  falls back to the structural check and the request proceeds - refusing there does not add
+  safety, it just disables every lookup, which is the worse failure.
 - **Single-instance only.** State lives in one JSON file, so two polling processes would
   overwrite each other and Telegram would return `Conflict`. One instance per token.
 - **The JSON store does not scale indefinitely.** It is rewritten as a whole file, which is
   fine for a community bot and wrong for thousands of very active chats. The migration path is
   SQLite; the accessor functions in `memory.py` are the seam to swap.
+- **GitHub's unauthenticated API allows 60 requests an hour per IP**, shared across whatever
+  else runs on the host. When that is used up the README is still read straight from
+  `raw.githubusercontent.com` (which is not rate-limited the same way), so a link still
+  resolves to real content.
 - **Social reading is best-effort.** The X, Reddit, Mastodon, Bluesky, TikTok and Telegram
   endpoints are public and undocumented for this use, so any of them can rate-limit, change
   shape, or block a datacenter IP without notice. Every one of them falls back to the page's
