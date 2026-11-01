@@ -23,12 +23,19 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Tells apart who said what in group conversations
 - Reads photos, documents, voice notes, and audio
 - Understands plain requests with no command — say "make me a report" and it attaches the file, or "draw a logo" and it makes the image
+- **Thinks as hard as the task needs, by itself.** It classifies each message before the
+  first model call: a plain chat or an md/txt document runs fast; a live lookup or a
+  comparison runs at a middle setting; **code, an audit, or a hard debug question gets the
+  deepest pass** (higher thinking level, a 45s budget and a 6144-token answer). No switch to
+  flip — and if a model rejects the top thinking level it steps down one level instead of
+  switching thinking off.
 - **Checks generated code before handing it over**: every file is syntax-checked by type
   (JSON parses, Python compiles, HTML tags balance, CSS/JS brackets balance, CSV columns
   line up); a broken file is sent back to the model once to repair, and if it still fails
   you are told plainly instead of being given a file that will not run
 - Attaches a file **only when you asked for one**, and never pastes its contents into the
-  chat as well — you get the file plus two lines about it
+  chat as well — you get the file plus one short caption. This holds on both paths: a
+  `[file:]` block, and the plain-word fallback that saves the reply itself as a file
 - Posts a small "working on it…" line while a long job runs, and removes it the moment
   the answer arrives
 - Knows what it just did: command replies go into the chat transcript, so a follow-up like "iska matlab kya hai?" still has the `/research` result in front of it
@@ -209,6 +216,8 @@ not rediscover it the hard way.
 - **The JSON store does not scale indefinitely.** It is rewritten as a whole file, which is
   fine for a community bot and wrong for thousands of very active chats. The migration path is
   SQLite; the accessor functions in `memory.py` are the seam to swap.
+- **A voice reply sends the text as well by default.** Set `VOICE_ALSO_TEXT=false` for
+  voice-only if the text feels like a duplicate of what you just heard.
 - **Generated code is checked, not executed.** Syntax and structure are validated locally;
   the bot never runs model-written code on its own host, because a prompt injection could
   then make it run anything. Running it safely needs a separate disposable container, which

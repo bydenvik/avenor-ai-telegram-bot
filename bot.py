@@ -231,6 +231,10 @@ TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT", "45") or "45")   # was 60 - a 60
 # long past the point the user has moved on; the text reply is already sent by then.
 ENABLE_STREAM = (os.environ.get("ENABLE_STREAM", "true").strip().lower()
                  not in ("0", "false", "no", "off"))
+# A voice reply currently sends the text AND the voice note. Some people want both (read it
+# later); some see the text as a duplicate of what they just heard. Set false for voice-only.
+VOICE_ALSO_TEXT = (os.environ.get("VOICE_ALSO_TEXT", "true").strip().lower()
+                   not in ("0", "false", "no", "off"))
 GROUP_MODE = os.environ.get("GROUP_MODE", "all").strip().lower()   # all | mention
 STREAM_INTERVAL = 0.9
 # Streaming had NO timeout at all - one hung model meant the user waited forever. These
@@ -265,6 +269,85 @@ GEMINI_BUDGET = float(os.environ.get("GEMINI_BUDGET", "18") or "18")
 # search rounds, three calculator rounds, three exact-tool rounds, a "no live access" retry
 # and an empty-reply retry. Nothing used to bound the total, so a single unlucky message
 # could spend ~13 calls and a minute of the free daily quota. This is the ceiling per turn.
+# ---- Effort: the bot picks its own thinking depth per message ----------------------------
+# One global thinking level was wrong in both directions: a coding request got the same
+# "minimal" pass as "hi", so hard work was fast and shallow, while a greeting paid for reasoning
+# it did not need. Effort is chosen from the REQUEST before the first model call:
+#   fast     - ordinary chat, a plain md/txt document          -> minimal thinking, small budget
+#   standard - a lookup, a comparison, a multi-part question   -> low thinking
+#   deep     - code, an audit, a hard design/debug question    -> high thinking, big budget
+EFFORT_THINKING = {
+    "fast": (os.environ.get("EFFORT_FAST_THINKING", "minimal").strip().lower() or "minimal"),
+    "standard": (os.environ.get("EFFORT_STANDARD_THINKING", "low").strip().lower() or "low"),
+    "deep": (os.environ.get("EFFORT_DEEP_THINKING", "high").strip().lower() or "high"),
+}
+EFFORT_BUDGET = {
+    "fast": float(os.environ.get("EFFORT_FAST_BUDGET", "12") or "12"),
+    "standard": float(os.environ.get("EFFORT_STANDARD_BUDGET", "20") or "20"),
+    "deep": float(os.environ.get("EFFORT_DEEP_BUDGET", "45") or "45"),
+}
+EFFORT_TOKENS = {
+    "fast": int(os.environ.get("EFFORT_FAST_TOKENS", "2048") or "2048"),
+    "standard": int(os.environ.get("EFFORT_STANDARD_TOKENS", "3072") or "3072"),
+    "deep": int(os.environ.get("EFFORT_DEEP_TOKENS", "6144") or "6144"),
+}
+# How many models may report "quota exhausted" before the Gemini walk gives up. Deep work walks
+# the whole chain, because a half-finished answer is worse than a slow one.
+EFFORT_PATIENCE = {
+    "fast": int(os.environ.get("EFFORT_FAST_PATIENCE", "2") or "2"),
+    "standard": int(os.environ.get("EFFORT_STANDARD_PATIENCE", "2") or "2"),
+    "deep": int(os.environ.get("EFFORT_DEEP_PATIENCE", "6") or "6"),
+}
+
+# Anything that means "code" - a language, a file extension, or the plain word. Talking about
+# code deserves the deepest pass even when the person did not ask for a file.
+_EFFORT_CODE_RE = re.compile(
+    r"\.(?:py|js|ts|jsx|tsx|html?|css|scss|sql|sh|bash|java|cpp|cs|go|rs|php|rb)\b|"
+    r"\b(?:python|javascript|typescript|html|css|sql|bash|shell|java|golang|rust|php|react|"
+    r"node|django|flask|fastapi|api|endpoint|regex|dockerfile|code|script|program|function|"
+    r"class|method|website|webapp|web\s*app|frontend|backend|algorithm|recursion|database|"
+    r"query|deploy|bug)\b", re.I)
+_EFFORT_DEEP_RE = re.compile(
+    r"\b(?:debug|refactor|architect\w*|algorithm|optimi[sz]e|fix|bug|implement|design|"
+    r"audit|review|migrate|benchmark|prove|derive|step\s*by\s*step|explain\s+why|"
+    r"trade-?offs?|compare|evaluate|strategy|roadmap|plan|deeply|thinking|research)\b", re.I)
+
+
+def _effort_for(text: str, media=None) -> str:
+    """Pick the thinking depth for ONE message. Pure and total.
+
+    Order matters: code beats everything, then live research, then heavy reasoning, then a
+    multi-part question, then a plain document, then ordinary chat.
+    """
+    t = text or ""
+    wants_file = _file_requested(t)
+    if _EFFORT_CODE_RE.search(t):
+        # Coding work always gets the deepest pass. The regex above is deliberately broad
+        # (a language name, a file extension, or the word "code"/"function"/"query"), because
+        # "python me sort function likho" matched the language but not a file request, and
+        # came out as a shallow fast answer.
+        return "deep"
+    if _needs_live(t) or _URL_MSG_RE.search(t):
+        if len(t) > 350 or _EFFORT_DEEP_RE.search(t):
+            return "deep"
+        return "standard"
+    if _EFFORT_DEEP_RE.search(t) and len(t) > 60:
+        return "deep"
+    if t.count("?") >= 2 or (len(t) > 300 and "\n" in t):
+        return "standard"
+    if wants_file:
+        return "fast"                     # a plain md/txt/report document
+    return "fast"                         # ordinary chat
+
+
+_EFFORT_BY_CHAT: dict = {}                # chat_id -> effort for the turn in flight
+# If a model rejects a thinking LEVEL (not the whole feature), remember a lower one instead of
+# switching thinking off for the rest of the process - otherwise one "high is not supported"
+# reply silently turns every later answer back into a fast, shallow one.
+_LEVEL_DOWNGRADE = {"high": "low", "low": "minimal", "minimal": ""}
+_LEVEL_IN_USE: dict = {}                  # requested level -> level the models accept
+
+
 TURN_MAX_CALLS = max(1, int(os.environ.get("TURN_MAX_CALLS", "8") or "8"))
 TURN_BUDGET = float(os.environ.get("TURN_BUDGET", "90") or "90")   # seconds, wall clock
 _TURN: dict = {}       # chat_id -> [calls_used, deadline_monotonic]
@@ -2299,6 +2382,72 @@ def _file_wanted(text: str) -> bool:
     return _file_requested(text or "")
 
 
+_CODE_MARKERS = ("{", "}", ";", "</", "function ", "def ", "import ", "class ",
+                 "#include", "<?php", "<!DOCTYPE", "@media", "=>", "SELECT ", "print(")
+
+
+def _looks_like_code(text: str) -> bool:
+    """True when a block is source code rather than prose. Pure."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    hits = sum(t.count(m) for m in _CODE_MARKERS)
+    if hits >= 6:
+        return True
+    return len(t) > 200 and hits >= 3
+
+
+def _first_prose(text: str, limit: int = 300) -> str:
+    """The first paragraph that is prose, not code. Pure."""
+    for block in re.split(r"\n\s*\n", text or ""):
+        b = block.strip()
+        if not b or _looks_like_code(b):
+            continue
+        if len(b) > limit:
+            cut = b[:limit]
+            for sep in (". ", "! ", "? ", "\n"):
+                if sep in cut:
+                    cut = cut[:cut.rfind(sep) + 1]
+                    break
+            b = cut.rstrip()
+        return b
+    return ""
+
+
+def _visible_after_file(text: str, bodies: list, filename: str = "") -> str:
+    """What the CHAT should say once a file has been attached.
+
+    Deterministic on purpose. The earlier version compared the reply against the file body and
+    only trimmed on a 50% overlap - which missed the real case entirely: the natural-language
+    fallback attaches the REPLY ITSELF as the file, so the person got the file and the whole
+    source code underneath it. Now: lines that are already in the file are dropped, and anything
+    that still looks like code (or is simply long) collapses to its first prose paragraph.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    hay = "\n".join(bodies or [])
+    if hay:
+        t = "\n".join(ln for ln in t.splitlines()
+                       if not (len(ln.strip()) > 20 and ln.strip() in hay)).strip()
+    if not t:
+        return ""
+    if _looks_like_code(t) or len(t) > 500:
+        prose = _first_prose(t)
+        if not prose:
+            return ""
+        return prose + "\n\n📎 Full version attached."
+    return t
+
+
+def _caption_for_attachment(text: str, filename: str) -> str:
+    """The short line shown when the attachment IS the reply."""
+    prose = _first_prose(text, 240)
+    if prose:
+        return f"{prose}\n\n📎 Full version attached: `{filename}`"
+    return f"📎 `{filename}` — ready."
+
+
 def _strip_repeated_file_text(text: str, bodies: list) -> str:
     """Drop visible text that merely repeats what is now inside the attached file.
 
@@ -3050,17 +3199,21 @@ def _gemma_contents(contents, sys_instr: str):
     return out or contents
 
 
-def _gen_config(sys_instr: str, model: str = "", thinking: bool = True):
+def _gen_config(sys_instr: str, model: str = "", thinking: bool = True,
+                level: str = "", max_tokens: int = 0):
     """Build the request config. Thinking is minimised by default - it is the biggest
     source of reply delay. It is never allowed to be the reason a request fails: the
     caller retries the same model with no thinking config at all."""
     kw = {} if _is_gemma(model) else {"system_instruction": sys_instr}
-    if MAX_OUTPUT_TOKENS > 0:
-        kw["max_output_tokens"] = MAX_OUTPUT_TOKENS
+    tokens = max_tokens or MAX_OUTPUT_TOKENS
+    if tokens > 0:
+        kw["max_output_tokens"] = tokens
     if thinking and _thinking_allowed(model):
         try:
-            if THINKING_LEVEL:
-                kw["thinking_config"] = types.ThinkingConfig(thinking_level=THINKING_LEVEL)
+            chosen = (level or THINKING_LEVEL or "").strip().lower()
+            chosen = _LEVEL_IN_USE.get(chosen, chosen)
+            if chosen:
+                kw["thinking_config"] = types.ThinkingConfig(thinking_level=chosen)
             elif THINKING_BUDGET >= 0:
                 kw["thinking_config"] = types.ThinkingConfig(thinking_budget=THINKING_BUDGET)
         except Exception as e:  # noqa: BLE001
@@ -3312,7 +3465,7 @@ async def send_generated_image(bot, chat_id: int, prompt: str,
         return False
 
 
-async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
+async def _gemini_pass(contents, sys_instr, budget: float = 0.0, effort: str = ""):
     """One walk over the model chain -> (answer or None, last error).
 
     `budget` caps the WHOLE walk in seconds (0 = no cap). Without it, 6 models x 2
@@ -3323,6 +3476,9 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
     global _THINKING_OK
     last = ""
     quota_hits = 0
+    level = EFFORT_THINKING.get(effort, "") or THINKING_LEVEL
+    tokens = EFFORT_TOKENS.get(effort, MAX_OUTPUT_TOKENS)
+    patience = EFFORT_PATIENCE.get(effort, 2)
     _retried_503 = False          # only one 503-retry per walk, so it cannot stall us
     deadline = (time.monotonic() + budget) if budget else 0.0
     for model in _model_order():
@@ -3342,7 +3498,7 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
                 resp = await asyncio.wait_for(
                     client.aio.models.generate_content(
                         model=model, contents=_contents,
-                        config=_gen_config(sys_instr, model, thinking)),
+                        config=_gen_config(sys_instr, model, thinking, level, tokens)),
                     timeout=per_call,
                 )
                 answer = (resp.text or "").strip()
@@ -3377,6 +3533,15 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
                     continue
                 if (thinking and not quota and not timed_out and not overloaded
                         and "404" not in last and "not found" not in last.lower()):
+                    # Was it the LEVEL that was rejected, or thinking as a whole? Downgrade the
+                    # level first; only give up on thinking when even "minimal" fails.
+                    low = last.lower()
+                    if any(k in low for k in ("thinking_level", "thinking level", "level")):
+                        nxt = _LEVEL_DOWNGRADE.get(level)
+                        if nxt:
+                            _LEVEL_IN_USE[level] = nxt
+                            log.warning("thinking level %r rejected - using %r from now on",
+                                        level or "(default)", nxt or "off")
                     _THINKING_OK = False   # retry the SAME model without thinking
                     continue
                 _mark_fail(model, last)
@@ -3389,7 +3554,7 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
                     # Gemini quota is shared per PROJECT, so once two models say 429 the
                     # rest will too - stop hammering and let Groq/Pollinations answer.
                     quota_hits += 1
-                    if quota_hits >= 2:
+                    if quota_hits >= patience:
                         log.warning("Gemini quota looks exhausted - skipping the rest of the chain")
                         return None, last
                 else:
@@ -3399,7 +3564,8 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0):
 
 
 async def ask_gemini(chat_id, prompt_text: str, context: str,
-                     image=None, audio=None, doc=None) -> str:
+                     image=None, audio=None, doc=None, effort: str = "") -> str:
+    effort = effort or _EFFORT_BY_CHAT.get(chat_id, "")
     if not _turn_allows(chat_id):
         log.info("turn budget used up for chat %s - answering without another model call", chat_id)
         return BUSY_MSG
@@ -3410,7 +3576,8 @@ async def ask_gemini(chat_id, prompt_text: str, context: str,
     ans, last_err, gem_err = None, "NOKEY", ""
     _t0 = time.monotonic()
     if client is not None:
-        ans, gem_err = await _gemini_pass(contents, sys_instr, GEMINI_BUDGET)
+        ans, gem_err = await _gemini_pass(contents, sys_instr,
+                                          EFFORT_BUDGET.get(effort, GEMINI_BUDGET), effort)
         last_err = gem_err
     if ans:
         return ans
@@ -3448,7 +3615,9 @@ async def ask_gemini(chat_id, prompt_text: str, context: str,
     if client is not None and not quota and _first_pass_s < 5.0:
         log.info("first pass failed in %.1fs - trying once more", _first_pass_s)
         await asyncio.sleep(0.5)
-        ans2, last2 = await _gemini_pass(contents, sys_instr, min(GEMINI_BUDGET, 12.0))
+        ans2, last2 = await _gemini_pass(
+            contents, sys_instr,
+            min(EFFORT_BUDGET.get(effort, GEMINI_BUDGET), 12.0), effort)
         if ans2:
             log.info("Answered on the second pass")
             return ans2
@@ -3465,9 +3634,13 @@ async def ask_gemini(chat_id, prompt_text: str, context: str,
 
 # ============================ PART 13b: LIVE STREAMING (private chats) ============================
 async def ask_gemini_stream(chat_id, prompt_text: str, context: str,
-                            bot, chat_id_int, message, image=None, audio=None, doc=None):
+                            bot, chat_id_int, message, image=None, audio=None, doc=None,
+                            effort: str = ""):
     if client is None or not ENABLE_STREAM:
         return None
+    effort = effort or _EFFORT_BY_CHAT.get(chat_id, "")
+    _level = EFFORT_THINKING.get(effort, "") or THINKING_LEVEL
+    _tokens = EFFORT_TOKENS.get(effort, MAX_OUTPUT_TOKENS)
     contents = [types.Content(role="user", parts=_user_parts(prompt_text, image, audio, doc))]
     sys_instr = SYSTEM_PROMPT + "\n\n" + context
     draft_id = random.randint(1, 2_000_000_000)
@@ -3480,7 +3653,7 @@ async def ask_gemini_stream(chat_id, prompt_text: str, context: str,
         smodel = order[0]
         stream = await client.aio.models.generate_content_stream(
             model=smodel, contents=contents,
-            config=_gen_config(sys_instr, smodel, True),
+            config=_gen_config(sys_instr, smodel, True, _level, _tokens),
         )
         # Watchdog: the stream had no timeout at all, so one hung/slow model made the user
         # wait indefinitely. We now bound the first token, each later chunk, and the total.
@@ -4564,6 +4737,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             text = "(the user just asked for a voice reply)"
     lang = detect_language(text, chat_id)
     CHAT_LANG[chat_id] = lang
+    # How hard is this? Decided BEFORE the first model call, then used by every call in this
+    # turn (the answer, each search round, each repair). fast / standard / deep.
+    effort = _effort_for(text, media)
+    _EFFORT_BY_CHAT[chat_id] = effort
+    log.info("effort=%s for chat %s (%s)", effort, chat_id, (text or "")[:60])
 
     async with turn_lock(chat_id, getattr(u.effective_user, "id", 0)):
         stop_evt = asyncio.Event()
@@ -4778,6 +4956,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             file_sent = False
             filed_bodies: list = []
             file_note = ""
+            filed_name = ""
             for fm in list(_FILE_BLOCK_RE.finditer(ans or ""))[:2]:
                 fname, fbody = fm.group(1).strip(), fm.group(2)
                 ans = (ans or "").replace(fm.group(0), "").strip()
@@ -4796,6 +4975,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     file_note = note
                 if await send_made_file(c.bot, chat_id, fname, body):
                     file_sent = True
+                    filed_name = fname
             # An unclosed [file: ...] block: everything after it was meant to be the file.
             mo = _FILE_OPEN_RE.search(ans or "")
             if mo and not file_sent:
@@ -4808,9 +4988,12 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         file_note = note
                     if await send_made_file(c.bot, chat_id, fname, body):
                         file_sent = True
+                        filed_name = fname
                         ans = (ans or "")[:mo.start()].strip()
             if file_sent:
-                ans = _strip_repeated_file_text(ans, filed_bodies)
+                ans = _visible_after_file(ans, filed_bodies)
+                if not ans:
+                    ans = f"📎 `{filed_name or 'file'}` — ready."
                 if file_note:
                     ans = (ans + "\n\n" + file_note).strip()
             if _VOICE_TAG_RE.search(ans or ""):
@@ -4914,8 +5097,15 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # words (no command). If the answer is substantial, attach it as a real download.
             if (not file_sent and text and _file_requested(text)
                     and len(clean) >= FILE_FALLBACK_MIN and action_allowed(chat_id, "file")):
-                if await send_made_file(c.bot, chat_id, _guess_filename(text, clean), clean):
+                _fname = _guess_filename(text, clean)
+                if await send_made_file(c.bot, chat_id, _fname, clean):
                     file_sent = True
+                    filed_name = _fname
+                    # The attachment IS this reply, so the chat gets a caption - not the same
+                    # text again. This was the actual dump in the screenshots: the model wrote
+                    # the page in its answer, the fallback saved that answer as index.html, and
+                    # then the whole answer was also sent as a message underneath.
+                    clean = _caption_for_attachment(clean, _fname)
                     log.info("auto-attached a file for chat %s (plain-word request)", chat_id)
 
             log_line(chat_id, "Avenor", clean, 0)      # the bot is not a user
@@ -4934,7 +5124,8 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     log.warning("Image send failed (%s): %s", url[:60], e)
 
             rp = _quote_reply_parameters(msg, ans)   # quote a part of their message, if any
-            for chunk in split_text(clean):
+            _voice_only = bool(want_voice and not VOICE_ALSO_TEXT and client is not None)
+            for chunk in ([] if _voice_only else split_text(clean)):
                 await _safe_send(u, c, md_to_html(chunk), chunk, rp)
                 rp = None                            # only the first chunk carries the quote
             log.info("timing[%s] prep=%.2fs ctx=%.2fs ai=%.2fs send=%.2fs TOTAL=%.2fs (stream=%s)",
@@ -4958,6 +5149,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             typing_task.cancel()
             await progress.finish()
             _turn_end(chat_id)
+            _EFFORT_BY_CHAT.pop(chat_id, None)
 
 
 async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7529,6 +7721,8 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              f"👥 Group mode: {GROUP_MODE}",
              f"👑 Owner IDs: {len(OWNER_IDS)} set"
              + (f" | name match ON ({len(OWNER_NAMES)})" if NAME_OWNER_MATCH else ""),
+             "🧠 Effort: fast=%s / standard=%s / deep=%s (auto per message)" % (
+                 EFFORT_THINKING["fast"], EFFORT_THINKING["standard"], EFFORT_THINKING["deep"]),
              "🛡 Abuse guard: 1 reply/user at a time"
              + (f", daily cap {USER_DAILY_CAP}" if USER_DAILY_CAP else ", no daily cap"),
              f"💾 Memory file: {getattr(MEM, 'MEMORY_FILE', 'n/a')}",
