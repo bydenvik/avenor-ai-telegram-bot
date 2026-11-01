@@ -29,6 +29,17 @@ The bot is meant to run as a long-lived service. It should work on any platform 
   deepest pass** (higher thinking level, a 45s budget and a 6144-token answer). No switch to
   flip — and if a model rejects the top thinking level it steps down one level instead of
   switching thinking off.
+- **Checks its own page before handing it over.** Beyond syntax, an HTML file is audited the
+  way a person would look at it: is there any CSS, is there a viewport meta, do the nav
+  links point at ids that exist, is there real content or lorem ipsum, how many
+  sections did they ask for versus get, how many colours does it actually use, is it the
+  default framework blue. Every fault found is handed back to the model with the file and
+  fixed, up to two rounds. A "make me a website" request that comes back under 2.5 KB is
+  sent back once for a real build first. With `PREVIEW_RENDER=true` and a Chromium on the
+  host it also screenshots the page and posts the picture
+- **Edits what it just sent.** "Header ka colour badlo" changes the file from the last
+  hour instead of starting a new project - the previous file is put back in front of the
+  model, and it must return the whole thing with only the asked-for change
 - **Checks generated code before handing it over**: every file is syntax-checked by type
   (JSON parses, Python compiles, HTML tags balance, CSS/JS brackets balance, CSV columns
   line up); a broken file is sent back to the model once to repair, and if it still fails
@@ -45,7 +56,12 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Reads social **posts**, not just their preview card, using public endpoints only (no API
   key, no login, no app registration): X/Twitter, Reddit (post + top comments), Mastodon,
   Bluesky (post + replies), TikTok, and public Telegram channels. Instagram, Facebook and
-  LinkedIn fall back to their Open Graph data, which is all they publish
+  LinkedIn fall back to their Open Graph data, which is all they publish. Reddit is read
+  through its **.rss** view because the .json view answers 403 to any server-side client
+- **Looks at what it reads.** A YouTube link gives the title, channel, view count, publish
+  date, description, the public captions **and the top comments** - and the thumbnail is
+  passed to the model as an image, so it can describe what is actually on screen instead
+  of guessing from the title
 - Reads a **GitHub** link for real — repository metadata, the top-level file list, the
   README, or a single file's raw contents — instead of the "Contribute to …" card
 - `/skills` prints exactly what it can and cannot do — generated from the same table the

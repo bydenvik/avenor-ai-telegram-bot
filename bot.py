@@ -3385,6 +3385,282 @@ async def _fatten_if_thin(chat_id, name: str, body: str, request_text: str) -> t
     return body, ""
 
 
+
+# ---------------------------------------------------------------------------------------
+# A generated page is CHECKED, not just validated. validate_file() only answers "does this
+# parse"; it says nothing about whether the thing is any good - which is how a 3-div stub and
+# a page whose nav links go nowhere both passed. These checks are the ones a person would
+# make on first look, done in code so they cost nothing and never vary.
+# ---------------------------------------------------------------------------------------
+_LOREM_RE = re.compile(r"\b(lorem ipsum|dolor sit amet|TODO|FIXME|placeholder text|"
+                       r"your text here|coming soon)\b", re.I)
+_HEX_RE = re.compile(r"#[0-9a-fA-F]{6}\b")
+_BAD_HEX = {"#007bff", "#0d6efd", "#6610f2", "#6f42c1", "#7952b3"}
+_CLONE_RE = re.compile(
+    r"\b(?:same\s*to\s*same|clone|copy\s+of|exactly\s+like|jaisa|jaisi|jeisa|"
+    r"jaise|ki\s+tarah|ke\s+jaise|look\s+like)\b", re.I)
+
+
+def _visible_text_len(html_text: str) -> int:
+    """Roughly how much real reading matter a page has (tags, CSS and JS removed)."""
+    t = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", html_text or "")
+    t = re.sub(r"(?s)<!--.*?-->", " ", t)
+    t = re.sub(r"<[^>]+>", " ", t)
+    return len(re.sub(r"\s+", " ", html.unescape(t)).strip())
+
+
+def _html_audit(html_text: str, request: str = "") -> tuple:
+    """(blocking, minor) - what a person would notice is wrong at a glance.
+
+    `blocking` problems are worth ONE more model pass; `minor` ones are reported in the
+    caption instead (a hover state is not worth another 20 seconds of the user's time).
+    """
+    body = html_text or ""
+    low = body.lower()
+    blocking, minor = [], []
+    if "<style" not in low and "style=" not in low:
+        blocking.append("there is no CSS at all - it renders as unstyled text")
+    if "name=\"viewport\"" not in low and "name='viewport'" not in low:
+        blocking.append("no <meta name=viewport>, so it is unusable on a phone")
+    if "<title" not in low:
+        minor.append("no <title>")
+    # --- navigation that actually works
+    ids = set(re.findall(r'id="([^"]{1,60})"', body)) | set(
+        re.findall(r"id='([^']{1,60})'", body))
+    anchors = [a for a in re.findall(r'href="#([^"]{1,60})"', body) if a]
+    dead = sorted({a for a in anchors if a not in ids and a.lower() not in ("", "top")})
+    if dead:
+        blocking.append("nav/links point at #" + ", #".join(dead[:6]) +
+                        " but no element has those ids, so clicking does nothing")
+    if anchors and not ids:
+        blocking.append("every link is an empty # - the navigation does not navigate")
+    # --- real content, not a placeholder
+    # 200 characters is roughly "a heading and one real sentence". Below that the page is
+    # a placeholder no matter how pretty it is; above it, a deliberately short landing page
+    # is a legitimate design and must not trigger another model round.
+    txt_len = _visible_text_len(body)
+    if txt_len < 200:
+        blocking.append(f"there is almost no readable content ({txt_len} characters)")
+    m = _LOREM_RE.search(body)
+    if m:
+        blocking.append(f"it contains placeholder text ({m.group(0)!r})")
+    # --- pages/sections the person actually asked for
+    asked = 0
+    mp = re.search(r"\b(\d{1,2})\s*(?:pages?|screens?|sections?|tabs?)\b", request or "", re.I)
+    if mp:
+        asked = int(mp.group(1))
+    elif re.search(r"\bmultiple\s+(?:pages?|screens?|sections?|tabs?)\b", request or "", re.I):
+        asked = 3
+    # count the ways a "page" is usually built in a single file: <section>, <article>,
+    # <main>, a .page wrapper, or a data-page attribute (the SPA style)
+    sections = (len(re.findall(r"(?i)<section\b", body))
+                + len(re.findall(r"(?i)<(?:article|main)\b", body))
+                + len(re.findall(r'(?i)class="[^"]*\bpage\b', body))
+                + len(re.findall(r"(?i)data-page\s*=", body)))
+    if asked >= 2 and sections < max(2, asked - 1):
+        blocking.append(f"they asked for {asked} pages/sections and there "
+                        f"{'is' if sections == 1 else 'are'} {sections}")
+    # --- a palette, not a default
+    hexes = {h.lower() for h in _HEX_RE.findall(body)}
+    if len(hexes) < 3:
+        blocking.append("only " + str(len(hexes)) + " colour(s) - no real palette or "
+                        "hierarchy")
+    bad = sorted(hexes & _BAD_HEX)
+    if bad:
+        blocking.append("it uses the generic framework blue/purple (" + ", ".join(bad[:3]) +
+                        ") - pick colours for this subject instead")
+    if ":hover" not in low and ":focus" not in low and "<a " in low:
+        minor.append("no :hover/:focus states")
+    if re.search(r"(?i)<img\b(?![^>]*\balt=)", body):
+        minor.append("an <img> without alt text")
+    if re.search(r"(?i)width\s*:\s*(?:9[0-9]{2}|1[0-9]{3})px", body) and "max-width" not in low:
+        minor.append("a fixed pixel width with no max-width (will overflow on a phone)")
+    return blocking, minor
+
+
+async def _polish_html(chat_id, name: str, body: str, request: str,
+                       rounds: int = 2) -> tuple:
+    """(body, note). Hand the model its own page back with the concrete faults, up to twice.
+
+    This is the closest thing to "look at it and fix it" that a bot without a browser can do:
+    the faults are measured from the actual file, not guessed, so the model is correcting
+    something real instead of being asked to "make it better".
+    """
+    if _ext(name) not in ("html", "htm"):
+        return body, ""
+    if not _WEB_ASK_RE.search(request or ""):
+        return body, ""
+    for _i in range(max(1, rounds)):
+        blocking, minor = _html_audit(body, request)
+        if not blocking:
+            if minor:
+                log.info("page %s passed the audit (minor: %s)", name, "; ".join(minor[:3]))
+            return body, ""
+        log.info("audit of %s found %s problem(s): %s", name, len(blocking),
+                 "; ".join(blocking)[:200])
+        try:
+            fix = await ask_gemini(
+                chat_id,
+                f"The page {name} you wrote has these concrete faults:\n- "
+                + "\n- ".join(blocking[:8]) +
+                f"\n\nReturn the COMPLETE corrected file inside a single "
+                f"[file: {name}] ... [/file] block. Fix every fault listed, keep everything "
+                f"that was already good, and do not add commentary.",
+                _guard("=== FIX THESE, THEN RETURN THE WHOLE FILE ===\n"
+                       "Each line is measured from the file itself, not an opinion. "
+                       "Return the full file - not a diff, not an explanation.\n"
+                       "- Keep the same subject and the same sections the person asked for.\n"
+                       "- If a nav link points at an id that does not exist, either add the "
+                       "section with that id or point the link at the right one.\n"
+                       "- Replace placeholder text with real content in the user's language.\n"
+                       "- Choose a palette for this subject: one dominant colour, one accent, "
+                       "neutrals. Never #007bff / #0d6efd / a default purple gradient.\n"
+                       "- Add the viewport meta, and use flex/grid so it fits a phone."))
+            m = _FILE_BLOCK_RE.search(fix or "")
+            if not m:
+                break
+            cand = m.group(2)
+            if validate_file(name, cand):
+                log.info("polish returned an invalid file - keeping the previous one")
+                break
+            if len(cand.encode("utf-8")) < 400:
+                break
+            body = cand
+        except Exception as e:  # noqa: BLE001
+            log.warning("polish failed: %s", str(e)[:120])
+            break
+    blocking, minor = _html_audit(body, request)
+    # "a bit short" is not a fault worth alarming the person about - it is a note.
+    soft = [b for b in blocking if b.startswith("there is almost no readable content")]
+    hard = [b for b in blocking if b not in soft]
+    if hard:
+        return body, "⚠️ Still imperfect: " + "; ".join(hard[:3])[:200]
+    if soft:
+        return body, ""
+    return body, ""
+
+
+# ---- the last file the bot sent, so "change the header colour" can actually edit it ------
+_LAST_FILE: dict = {}          # chat_id -> {"name","body","ts"}
+LAST_FILE_TTL = float(os.environ.get("LAST_FILE_TTL", "3600") or "3600")
+_EDIT_RE = re.compile(
+    r"\b(?:isko|ise|is\s*ko|ismein|usmein|usko|us\s*ko|the\s+file|file\s+mein|"
+    r"file\s+me|code\s+mein|page\s+mein|website\s+mein|html\s+mein|"
+    r"change|badlo|badal|update|edit|modify|fix|add|hatao|remove|chhota|bada|"
+    r"colour|color|font|layout|header|footer|button|text)\b", re.I)
+
+
+def _looks_like_edit(text: str) -> bool:
+    """Is this person asking to change the file we just sent, rather than a new one?"""
+    t = text or ""
+    if len(t) > 400:
+        return False
+    hits = len({m.group(0).lower() for m in _EDIT_RE.finditer(t)})
+    return hits >= 2
+
+
+def _last_file_for(chat_id: int):
+    rec = _LAST_FILE.get(chat_id)
+    if not rec:
+        return None
+    if time.time() - rec.get("ts", 0) > LAST_FILE_TTL:
+        _LAST_FILE.pop(chat_id, None)
+        return None
+    return rec
+
+
+def _remember_file(chat_id: int, name: str, body: str) -> None:
+    _LAST_FILE[chat_id] = {"name": name, "body": body, "ts": time.time()}
+
+
+def _edit_context(chat_id: int, text: str) -> str:
+    """The current file, handed back to the model when the person asks for a change."""
+    rec = _last_file_for(chat_id)
+    if not rec or not _looks_like_edit(text):
+        return ""
+    log.info("edit request for chat %s against %s (%s bytes)",
+             chat_id, rec["name"], len(rec["body"]))
+    return ("\n\n=== THE FILE YOU SENT THEM EARLIER (this is what they want changed) ===\n"
+            f"name: {rec['name']}\n"
+            "-----\n" + rec["body"][:14000] + "\n-----\n"
+            "They are asking for a CHANGE to THIS file, not a new project. Return the "
+            "COMPLETE updated file in a [file: " + rec["name"] + "] ... [/file] block - keep "
+            "everything they did not ask you to change, byte for byte where possible. Do not "
+            "restart from scratch and do not shrink it.\n")
+
+
+
+# ---- an actual picture of the page (optional; needs a browser on the host) --------------
+# Everything else here is text. If the host has a headless Chromium (playwright), the bot can
+# take a real screenshot of the page it just wrote and SHOW it - which is the honest version
+# of "let me look at it first". It is opt-in because it needs ~150 MB of browser on the host
+# and system libraries a plain Python image may not have. When it is unavailable the code
+# says so once and carries on; nothing else depends on it.
+PREVIEW_RENDER = (os.environ.get("PREVIEW_RENDER", "false").strip().lower()
+                  in ("1", "true", "yes", "on"))
+PREVIEW_TIMEOUT = float(os.environ.get("PREVIEW_TIMEOUT", "25") or "25")
+_PREVIEW_STATE = {"ok": None, "told": False}
+
+
+async def _render_preview(html_text: str):
+    """A PNG of the page, or None. Never raises, never retries after the first failure."""
+    if not PREVIEW_RENDER or _PREVIEW_STATE["ok"] is False:
+        return None
+    try:
+        from playwright.async_api import async_playwright          # noqa: PLC0415
+    except Exception:
+        _PREVIEW_STATE["ok"] = False
+        if not _PREVIEW_STATE["told"]:
+            _PREVIEW_STATE["told"] = True
+            log.warning("PREVIEW_RENDER is on but playwright is not installed - no screenshot "
+                        "(pip install playwright && playwright install chromium)")
+        return None
+
+    async def _shoot():
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(args=["--no-sandbox",
+                                                     "--disable-dev-shm-usage"])
+            try:
+                page = await browser.new_page(viewport={"width": 1280, "height": 900})
+                await page.set_content(html_text, wait_until="load")
+                return await page.screenshot(full_page=False)
+            finally:
+                await browser.close()
+
+    try:
+        png = await asyncio.wait_for(_shoot(), timeout=PREVIEW_TIMEOUT)
+        if png and len(png) > 2000:
+            _PREVIEW_STATE["ok"] = True
+            log.info("preview rendered (%s bytes)", len(png))
+            return png
+        return None
+    except Exception as e:  # noqa: BLE001
+        _PREVIEW_STATE["ok"] = False
+        if not _PREVIEW_STATE["told"]:
+            _PREVIEW_STATE["told"] = True
+            log.warning("preview render unavailable (%s) - continuing without a screenshot; "
+                        "this is logged once", str(e)[:140])
+        return None
+
+
+async def _send_preview(bot, chat_id: int, name: str, body: str) -> None:
+    """Screenshot the page we just sent and post it, so the person sees it without opening."""
+    if _ext(name) not in ("html", "htm") or not PREVIEW_RENDER:
+        return
+    png = await _render_preview(body)
+    if not png:
+        return
+    try:
+        await rate_gate(chat_id)
+        await bot.send_photo(chat_id=chat_id, photo=io.BytesIO(png),
+                             caption=f"👀 Preview of {name} (as a browser renders it)")
+        # keep it too, so "isko theek karo" can be answered with the picture in view
+        _LINK_IMG.setdefault(chat_id, []).append(
+            (png, "image/png", f"rendered preview of {name}"))
+    except Exception as e:  # noqa: BLE001
+        log.debug("preview send failed: %s", str(e)[:100])
+
+
 def _attribution_line(name: str) -> str:
     """One honest, VISIBLE line naming the tool that generated the file.
 
@@ -5121,6 +5397,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
 
             ctx = await build_context(u, c.bot, lang, media_state, transcript, forward,
                                       want_voice, reply_media)
+            # "change the header colour" - put the file we just sent back in front of the
+            # model, so an edit is an EDIT and not a brand-new project.
+            _edctx = _edit_context(chat_id, text)
+            if _edctx:
+                ctx += _edctx
             prompt = recent_chat_block(chat_id, speaker)
             _t2 = time.monotonic()
 
@@ -5128,7 +5409,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # If the user pasted a link, fetch its page text NOW so the model can read it.
             if (RESEARCH_ENABLED and text and _URL_MSG_RE.search(text)
                     and action_allowed(chat_id, "link")):
-                link_text = _untrusted(await _read_links(text, 2))
+                link_text = _untrusted(await _read_links(text, 2, chat_id))
                 if link_text:
                     ctx += ("\n\n=== LINK CONTENT (fetched just now from the user's message) "
                             "===\n" + link_text +
@@ -5170,11 +5451,50 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                             "open it.")
                     log.info("link could not be read for chat %s", chat_id)
 
+            # ---- IMAGES THE LINK READERS FOUND ----------------------------------
+            # A video thumbnail or a post's picture, fetched while reading the link. They
+            # have to be merged HERE: _read_links() runs above, so popping the stash any
+            # earlier would hand the model the PREVIOUS turn's image.
+            _link_imgs = _LINK_IMG.pop(chat_id, None)
+            if _link_imgs:
+                _blobs = [(d, m) for d, m, _lbl in _link_imgs]
+                if image is None:
+                    image = _blobs[0] if len(_blobs) == 1 else _blobs
+                elif isinstance(image, list):
+                    image = list(image) + _blobs
+                else:
+                    image = [image] + _blobs
+                _lbls = ", ".join(lbl for _d, _m, lbl in _link_imgs)
+                log.info("attached %s link image(s) for chat %s: %s", len(_blobs),
+                         chat_id, _lbls)
+                ctx += ("\n\n=== IMAGES FROM THE LINK (attached to you) ===\n"
+                        "These were taken from the page/post/video the person linked: "
+                        + _lbls + ". Look at them and use what you actually SEE - colours, "
+                        "layout, text on screen, what the thumbnail shows - instead of "
+                        "guessing from the title. Never claim to have watched a video you "
+                        "only have a thumbnail of.")
+
             # ---- PRE-FLIGHT RESEARCH -------------------------------------------
             # The model frequently answers a live-data question with "I cannot access the
             # internet" instead of asking to search. For messages that are plainly about
             # something that changes, fetch it FIRST so the answer has real figures.
             pre_research = ""
+            # A "make it like <site>" / "same to same" request is a RESEARCH task before
+            # it is a coding task: the model cannot reproduce a layout it has never seen.
+            # So the reference is fetched first, and the file is written with it in view.
+            if (RESEARCH_ENABLED and text and _WEB_ASK_RE.search(text)
+                    and _CLONE_RE.search(text) and action_allowed(chat_id, "search")):
+                _q = re.sub(r"\s+", " ", text)[:120] + " homepage sections layout"
+                _ref = _untrusted(await free_web_search(_q, 4))
+                if _ref:
+                    ctx += ("\n\n=== REFERENCE RESEARCH (fetched now) ===\n" + _ref +
+                            "\n\nUse this to get the STRUCTURE right - the sections, their "
+                            "order, what each one contains. Build the page from it instead "
+                            "of inventing a generic layout. Do not copy any brand's logo, "
+                            "text or images; reproduce the layout and write real content.")
+                    pre_research = _ref
+                    log.info("code-reference research for %r -> %s chars",
+                             text[:50], len(_ref))
             if (RESEARCH_ENABLED and not media and text and len(text) > 4
                     and _needs_live(text) and action_allowed(chat_id, "search")):
                 await _kick_typing(c.bot, chat_id)
@@ -5222,6 +5542,14 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         "NOT mention that you searched, and never print the word [search].")
                 ans2 = await ask_gemini(chat_id, prompt, _guard(ctx2), image, audio, doc)
                 if ans2:
+                    # A [file:] block written BEFORE the lookup must not be lost when the
+                    # re-answer comes back as prose only - the person asked for a file.
+                    if ("[file:" in (ans or "").lower()
+                            and "[file:" not in (ans2 or "").lower()):
+                        _blk = _FILE_BLOCK_RE.search(ans or "")
+                        if _blk:
+                            ans2 = ans2.rstrip() + "\n\n" + _blk.group(0)
+                            log.info("kept the file block written before the lookup")
                     ans = ans2
                 else:
                     break
@@ -5329,11 +5657,14 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     continue
                 body, note = await _validate_and_repair(chat_id, fname, fbody)
                 body, thin_note = await _fatten_if_thin(chat_id, fname, body, text)
-                if note or thin_note:
-                    file_note = note or thin_note
+                body, polish_note = await _polish_html(chat_id, fname, body, text)
+                if note or thin_note or polish_note:
+                    file_note = note or thin_note or polish_note
                 if await send_made_file(c.bot, chat_id, fname, body):
                     file_sent = True
                     filed_name = fname
+                    _remember_file(chat_id, fname, body)
+                    await _send_preview(c.bot, chat_id, fname, body)
             # An unclosed [file: ...] block: everything after it was meant to be the file.
             mo = _FILE_OPEN_RE.search(ans or "")
             if mo and not file_sent:
@@ -5343,11 +5674,14 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     filed_bodies.append(body)
                     body, note = await _validate_and_repair(chat_id, fname, body)
                     body, thin_note = await _fatten_if_thin(chat_id, fname, body, text)
-                    if note or thin_note:
-                        file_note = note or thin_note
+                    body, polish_note = await _polish_html(chat_id, fname, body, text)
+                    if note or thin_note or polish_note:
+                        file_note = note or thin_note or polish_note
                     if await send_made_file(c.bot, chat_id, fname, body):
                         file_sent = True
                         filed_name = fname
+                        _remember_file(chat_id, fname, body)
+                        await _send_preview(c.bot, chat_id, fname, body)
                         ans = (ans or "")[:mo.start()].strip()
             if dropped_files and not file_sent:
                 # Nothing was attached, so nothing may say "open it".
@@ -5470,6 +5804,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 if await send_made_file(c.bot, chat_id, _fname, clean):
                     file_sent = True
                     filed_name = _fname
+                    _remember_file(chat_id, _fname, clean)
                     # The attachment IS this reply, so the chat gets a caption - not the same
                     # text again. This was the actual dump in the screenshots: the model wrote
                     # the page in its answer, the fallback saved that answer as index.html, and
@@ -5854,6 +6189,63 @@ _PROACTIVE_PENDING: set = set()
 #   * DuckDuckGo serves its lite page to a normal BROWSER agent (a bot-looking agent is
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
 _UA_BOT = "AvenorBot/1.0 (Telegram assistant; +https://t.me/AvenorAlBot)"
+# YouTube, Reddit, TikTok and X all answer a bot User-Agent with 403/429 and a browser
+# one with the data. Measured: reddit .json -> 403 with both, reddit .rss -> 200 with a
+# Chrome UA and 429 with the bot UA. So the social/YouTube path always looks like a
+# browser; the general fetch layer still identifies itself honestly.
+_UA_WEB = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like "
+           "Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+# A link reader can SEE what it read: the thumbnail of a video, the image of a post.
+# The blobs are stashed per chat and picked up by _answer(), which hands them to the
+# model as ordinary images - so the reply can be about what is visible, not just text.
+_LINK_IMG: dict = {}
+LINK_IMG_MAX = int(os.environ.get("LINK_IMG_MAX", "2") or "2")
+LINK_IMG_BYTES = int(os.environ.get("LINK_IMG_BYTES", str(4 * 1024 * 1024))
+                     or str(4 * 1024 * 1024))
+
+
+async def _stash_link_image(chat_id, url: str, label: str = "") -> bool:
+    """Download an image a link reader found and keep it for this turn."""
+    if not chat_id or not url:
+        return False
+    have = _LINK_IMG.get(chat_id) or []
+    if len(have) >= LINK_IMG_MAX:
+        return False
+    if not _url_is_public(url):
+        log.info("refusing a non-public link image: %s", url[:70])
+        return False
+    try:
+        r = await HTTP.get(url, headers={"User-Agent": _UA_WEB}, timeout=12)
+        if r.status_code != 200:
+            return False
+        data = r.content or b""
+        if not data or len(data) > LINK_IMG_BYTES:
+            return False
+        mime = (r.headers.get("content-type") or "").split(";")[0].strip() or "image/jpeg"
+        if not mime.startswith("image/"):
+            return False
+        _LINK_IMG.setdefault(chat_id, []).append((bytes(data), mime, label or url[:60]))
+        log.info("link image kept for chat %s: %s (%s bytes)", chat_id, mime, len(data))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.debug("link image failed: %s", str(e)[:100])
+        return False
+
+
+def _find_key(obj, key: str, out: list, depth: int = 0) -> None:
+    """Collect every value stored under `key` anywhere in a decoded JSON blob."""
+    if depth > 40 or len(out) > 60:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == key:
+                out.append(v)
+            _find_key(v, key, out, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            _find_key(v, key, out, depth + 1)
+
 # DDG's lite endpoint answers a bare request with HTTP 202 (a soft bot check) unless the
 # request looks like a browser. An Accept-Language header is what flips it to 200, and a
 # Referer helps. Both are set on every DDG request below.
@@ -6380,14 +6772,19 @@ def _social_plan(url: str):
         return None
     host = (p.hostname or "").lower()
     path = p.path or ""
-    hdrs = {"User-Agent": _UA_BOT, "Accept": "application/json, text/html;q=0.9,*/*;q=0.8"}
+    hdrs = {"User-Agent": _UA_WEB, "Accept": "application/json, text/html;q=0.9,*/*;q=0.8"}
 
     # ---- Reddit: the whole thread as JSON, no key (public .json view)
     if host in _REDDIT_HOSTS:
+        # MEASURED: reddit's .json view answers 403 to any server-side client (datacenter
+        # IP), with a bot UA and with a Chrome UA alike. The .rss view answers 200 with a
+        # Chrome UA - and a post's .rss carries the post AND its comments as entries. So
+        # RSS is tried first and .json is the fallback, not the other way round.
         if host == "redd.it" and path.strip("/"):
-            return ("reddit", f"https://www.reddit.com/comments/{path.strip('/')}.json", hdrs)
-        base = re.sub(r"\.json$", "", url.split("?")[0]).rstrip("/")
-        return ("reddit", base + ".json?limit=25&raw_json=1", hdrs)
+            pid = path.strip("/")
+            return ("reddit_rss", f"https://www.reddit.com/comments/{pid}/.rss", hdrs)
+        base = re.sub(r"\.(?:json|rss)$", "", url.split("?")[0]).rstrip("/")
+        return ("reddit_rss", base + "/.rss", hdrs)
 
     # ---- Mastodon: every instance exposes /api/v1/statuses/<id>
     m = re.match(r"^/@[^/]+/(\d+)$", path)
@@ -6455,6 +6852,43 @@ def _parse_reddit(js: dict) -> str:
     if comments:
         bits.append("top comments:\n" + "\n".join(comments))
     return "\n".join(bits)
+
+
+def _parse_reddit_rss(xml: str) -> str:
+    """A Reddit post and its top comments from the public .rss view.
+
+    Reddit's .json endpoint is closed to server IPs (403), so this is the path that
+    actually works. A post's .rss lists the post first and then its comments, each with
+    an <author><name> - which is exactly what "what are people saying" needs.
+    """
+    if not xml or "<entry" not in xml:
+        return ""
+    entries = re.findall(r"<entry>(.*?)</entry>", xml, re.S)
+    if not entries:
+        return ""
+    def _field(chunk, tag):
+        m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", chunk, re.S)
+        return html.unescape(re.sub(r"<[^>]+>", " ", m.group(1) or "")).strip() if m else ""
+    first = entries[0]
+    title = _field(first, "title")
+    author = _field(first, "name")
+    body = _clean(_field(first, "content"), 1200)
+    out = ["Reddit post"]
+    if title:
+        out.append("title: " + title[:300])
+    if author:
+        out.append("author: u/" + author.lstrip("u/"))
+    if body:
+        out.append("post: " + body)
+    comments = []
+    for chunk in entries[1:8]:
+        who = _field(chunk, "name") or "?"
+        txt = _clean(_field(chunk, "content"), 300)
+        if txt:
+            comments.append(f"- u/{who.lstrip('u/')}: {txt}")
+    if comments:
+        out.append("top comments:\n" + "\n".join(comments))
+    return "\n".join(out)
 
 
 def _parse_mastodon(js: dict) -> str:
@@ -6549,7 +6983,7 @@ _SOCIAL_PARSERS = {
 }
 
 
-async def _social_context(url: str) -> str:
+async def _social_context(url: str, chat_id: int = 0) -> str:
     """The actual post behind a social link, or '' (caller then falls back to Open Graph)."""
     plan = _social_plan(url)
     if not plan:
@@ -6562,6 +6996,8 @@ async def _social_context(url: str) -> str:
             return ""
         if kind in ("tg_channel", "tg_post"):
             out = _parse_tg_web(r.text)
+        elif kind == "reddit_rss":
+            out = _parse_reddit_rss(r.text)
         else:
             try:
                 js = r.json()
@@ -6724,13 +7160,71 @@ def _yt_unescape(s: str) -> str:
             .replace('\\"', '"').replace("\\u0026", "&").strip())
 
 
-async def _youtube_context(url: str) -> str:
-    """What a YouTube video is about - the legitimate, keyless way."""
+# YouTube's public web key. It is the key the youtube.com page itself ships in its own
+# HTML - not a secret, not an account, and it is what every keyless reader uses.
+_YT_WEBKEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+_YT_CTX = {"client": {"clientName": "WEB", "clientVersion": "2.20240726.00.00",
+                      "hl": "en", "gl": "US"}}
+
+
+async def _yt_player(vid: str) -> dict:
+    """videoDetails from YouTube's own player endpoint: title, views, description, thumb."""
+    try:
+        r = await HTTP.post(
+            "https://www.youtube.com/youtubei/v1/player?key=" + _YT_WEBKEY,
+            json={"context": _YT_CTX, "videoId": vid},
+            headers={"User-Agent": _UA_WEB, "Content-Type": "application/json"}, timeout=12)
+        if r.status_code != 200:
+            return {}
+        return (r.json() or {}).get("videoDetails") or {}
+    except Exception as e:  # noqa: BLE001
+        log.debug("yt player failed: %s", str(e)[:90])
+        return {}
+
+
+async def _yt_comments(page: str, want: int = 6) -> list:
+    """The top comments, from the same public endpoint the page uses to load them."""
+    if not page or "continuationCommand" not in page:
+        return []
+    tokens = re.findall(r'"continuationCommand":\{"token":"([^"]{40,})"', page)
+    if not tokens:
+        return []
+    for tok in tokens[:3]:
+        try:
+            r = await HTTP.post(
+                "https://www.youtube.com/youtubei/v1/next?key=" + _YT_WEBKEY,
+                json={"context": _YT_CTX, "continuation": tok},
+                headers={"User-Agent": _UA_WEB, "Content-Type": "application/json"},
+                timeout=12)
+            if r.status_code != 200:
+                continue
+            found: list = []
+            _find_key(r.json(), "commentEntityPayload", found)
+            out = []
+            for item in found[:want]:
+                props = item.get("properties") or {}
+                author = (item.get("author") or {}).get("displayName") or "?"
+                body = ((props.get("content") or {}).get("content") or "").strip()
+                if body:
+                    out.append(f"- {author}: " + re.sub(r"\s+", " ", body)[:300])
+            if out:
+                return out
+        except Exception as e:  # noqa: BLE001
+            log.debug("yt comments failed: %s", str(e)[:90])
+    return []
+
+
+async def _youtube_context(url: str, chat_id: int = 0) -> str:
+    """What a YouTube video IS - title, channel, views, description, thumbnail, captions,
+    and the top comments. The thumbnail is handed to the model as an image, so it can talk
+    about what the video actually looks like instead of guessing from the title."""
     vid = _yt_video_id(url)
     if not vid:
         return ""
     canon = "https://www.youtube.com/watch?v=" + vid
     title = author = desc = transcript = ""
+    views = published = thumb = ""
+    comments: list = []
     # 1. YouTube's own public oEmbed endpoint (documented, no key).
     try:
         r = await HTTP.get("https://www.youtube.com/oembed",
@@ -6742,14 +7236,35 @@ async def _youtube_context(url: str) -> str:
             author = j.get("author_name") or ""
     except Exception as e:  # noqa: BLE001
         log.debug("yt oembed failed: %s", str(e)[:80])
-    # 2. The public watch page carries the description and (often) the caption track.
+    # 2. The player endpoint: exact view count, publish date and the thumbnail list.
+    vd = await _yt_player(vid)
+    if vd:
+        title = title or (vd.get("title") or "")
+        author = author or (vd.get("author") or "")
+        desc = desc or (vd.get("shortDescription") or "")
+        if vd.get("viewCount"):
+            views = f"{int(vd["viewCount"]):,}"
+        thumbs = ((vd.get("thumbnail") or {}).get("thumbnails") or [])
+        if thumbs:
+            thumb = (thumbs[-1] or {}).get("url") or ""
+    # 3. The public watch page carries the caption track and the comment token.
     page = ""
     try:
-        r = await HTTP.get(canon, headers={**_YH_HEADERS, "User-Agent": _UA,
+        r = await HTTP.get(canon, headers={"User-Agent": _UA_WEB,
                                            "Accept-Language": "en-US,en;q=0.9",
-                                           "Cookie": "CONSENT=YES+1"}, timeout=10)
+                                           "Cookie": "SOCS=CAI; CONSENT=YES+1"}, timeout=12)
         if r.status_code == 200:
-            page = r.text or ""
+            page = (r.text or "")[:4000000]
+        if not thumb:
+            mt = re.search(r'"thumbnailUrl":\["([^"]+)"', page or "")
+            if mt:
+                thumb = mt.group(1)
+        mp = re.search(r'"publishDate":"([^"]+)"', page or "") or \
+            re.search(r'"uploadDate":"([^"]+)"', page or "")
+        if mp:
+            published = mp.group(1)[:10]
+        # the top comments, from the page's own comment continuation
+        comments = await _yt_comments(page)
     except Exception as e:  # noqa: BLE001
         log.debug("yt page failed: %s", str(e)[:80])
     if page:
@@ -6778,13 +7293,28 @@ async def _youtube_context(url: str) -> str:
                     log.debug("yt captions failed: %s", str(e)[:80])
     if not (title or desc or transcript):
         return ""
+    if not thumb:
+        thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    # the model gets the thumbnail as an IMAGE as well as the URL
+    if await _stash_link_image(chat_id, thumb, "YouTube thumbnail"):
+        pass
     out = ["YouTube video: " + (title or vid)]
     if author:
         out.append("channel: " + author)
+    if views:
+        out.append("views: " + views)
+    if published:
+        out.append("published: " + published)
+    if thumb:
+        out.append("thumbnail URL: " + thumb +
+                   " (the image itself is attached to you - look at it and describe what "
+                   "is actually on screen)")
     if desc:
         out.append("description: " + re.sub(r"\s+", " ", desc)[:1200])
     if transcript:
         out.append("transcript (public captions, may be partial): " + transcript)
+    if comments:
+        out.append("top comments (public):\n" + "\n".join(comments))
     return "\n".join(out)
 
 
@@ -6832,8 +7362,12 @@ async def _read_feed(url: str, n: int = 8) -> str:
     return f"=== FEED (latest {len(items)}) ===\n" + "\n".join(lines)
 
 
-async def _read_links(text: str, limit: int = 2) -> str:
-    """Fetch the pages behind links the user shared, so the model can actually read them."""
+async def _read_links(text: str, limit: int = 2, chat_id: int = 0) -> str:
+    """Fetch the pages behind links the user shared, so the model can actually read them.
+
+    `chat_id` lets a reader hand back an IMAGE as well as text (a video thumbnail, a
+    post's picture) - see _stash_link_image().
+    """
     urls = []
     for u in _URL_MSG_RE.findall(text or ""):
         u = u.rstrip(".,;:!?)]}\"'")
@@ -6852,7 +7386,7 @@ async def _read_links(text: str, limit: int = 2) -> str:
                 out.append(f"- {u}\n{feed}")
                 continue
         if _yt_video_id(u):
-            yt = await _youtube_context(u)
+            yt = await _youtube_context(u, chat_id)
             if yt:
                 out.append(f"- {u}\n{yt}")
                 continue
@@ -6862,7 +7396,7 @@ async def _read_links(text: str, limit: int = 2) -> str:
             out.append(f"- {u}\n{gh}")
             continue
         # A social link: read the POST, not just its link preview.
-        soc = await _social_context(u)
+        soc = await _social_context(u, chat_id)
         if soc:
             out.append(f"- {u}\n{soc}")
             continue
