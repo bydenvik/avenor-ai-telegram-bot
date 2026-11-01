@@ -29,6 +29,11 @@ The bot is meant to run as a long-lived service. It should work on any platform 
   deepest pass** (higher thinking level, a 45s budget and a 6144-token answer). No switch to
   flip — and if a model rejects the top thinking level it steps down one level instead of
   switching thinking off.
+- **Writes the request down before it builds.** A build request first produces a short
+  numbered spec of what was actually asked for, and that spec - not the whole chat - is the
+  brief the model builds against. The finished file is then checked against the same spec,
+  so "I asked for X and it built something else" gets caught and repaired instead of
+  shipped. `SPEC_ENABLED=false` turns it off
 - **Checks its own page before handing it over.** Beyond syntax, an HTML file is audited the
   way a person would look at it: is there any CSS, is there a viewport meta, do the nav
   links point at ids that exist, is there real content or lorem ipsum, how many
@@ -53,6 +58,11 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Says so plainly when a link could not be read, instead of describing a page it never saw
 - Sets reminders and delivers them on time ("remind me in 2h to call mom"), with no external service
 - Reads a link you paste and answers about the page — news, blogs and social links
+- Reads a post from **Vimeo, Dailymotion, SoundCloud, Spotify, Pinterest, Imgur, Flickr,
+  SlideShare and Kickstarter** through their public oEmbed endpoint, and from
+  **Instagram, Facebook, LinkedIn, Threads, Snapchat and Tumblr** through the Open Graph
+  card those pages publish. In both cases the post's picture is fetched and shown to the
+  model, so it can describe what is in it
 - Reads social **posts**, not just their preview card, using public endpoints only (no API
   key, no login, no app registration): X/Twitter, Reddit (post + top comments), Mastodon,
   Bluesky (post + replies), TikTok, and public Telegram channels. Instagram, Facebook and

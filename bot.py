@@ -3409,6 +3409,39 @@ def _visible_text_len(html_text: str) -> int:
     return len(re.sub(r"\s+", " ", html.unescape(t)).strip())
 
 
+# The name comes AFTER the connector in English ("like Amazon") and BEFORE it in Hinglish
+# ("flipkart jaisa"). Both are handled; a bare "same to same" names nothing, so it must
+# return '' rather than inventing a target (that is how "same to same and in single html"
+# once produced the search query "and in homepage sections").
+_CLONE_AFTER_RE = re.compile(
+    r"\b(?:same\s*(?:to\s*same\s*)?(?:as|of)|clone\s+of|copy\s+of|exactly\s+like|"
+    r"just\s+like|like)\s+([A-Za-z][A-Za-z0-9&.\-]*(?:\s+[A-Za-z][A-Za-z0-9&.\-]*){0,2})",
+    re.I)
+_CLONE_BEFORE_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9&.\-]*(?:\s+[A-Za-z][A-Za-z0-9&.\-]*){0,2})\s+"
+    r"(?:jaisa|jaisi|jaise|ki\s+tarah|ke\s+jaise|wala|wali|wale)\b", re.I)
+_CLONE_STOP = {"a", "an", "the", "this", "that", "it", "me", "my", "us", "site", "page",
+               "website", "html", "file", "one", "real", "original", "same", "and", "in",
+               "ek", "banao", "banana", "make", "create", "build", "web", "app", "single"}
+
+
+def _clone_target_of(text: str) -> str:
+    """The site/product a request wants copied, or '' when it is not a named clone."""
+    t = text or ""
+    if not _CLONE_RE.search(t):
+        return ""
+    for rx in (_CLONE_AFTER_RE, _CLONE_BEFORE_RE):
+        m = rx.search(t)
+        if not m:
+            continue
+        words = [w for w in m.group(1).strip(".,!?").split()
+                 if w.lower() not in _CLONE_STOP]
+        cand = " ".join(words[:2]).strip()
+        if len(cand) >= 2:
+            return cand
+    return ""
+
+
 def _html_audit(html_text: str, request: str = "") -> tuple:
     """(blocking, minor) - what a person would notice is wrong at a glance.
 
@@ -3420,7 +3453,7 @@ def _html_audit(html_text: str, request: str = "") -> tuple:
     blocking, minor = [], []
     if "<style" not in low and "style=" not in low:
         blocking.append("there is no CSS at all - it renders as unstyled text")
-    if "name=\"viewport\"" not in low and "name='viewport'" not in low:
+    if not re.search(r"name\s*=\s*[\"\']?viewport", low):
         blocking.append("no <meta name=viewport>, so it is unusable on a phone")
     if "<title" not in low:
         minor.append("no <title>")
@@ -3478,6 +3511,86 @@ def _html_audit(html_text: str, request: str = "") -> tuple:
     return blocking, minor
 
 
+# ---------------------------------------------------------------------------------------
+# INTENT DRIFT. The complaint was exact: "I asked for one thing and it built something
+# random." A 34k-character persona prompt, a research blob and a design brief all compete
+# with the actual sentence the person typed, and the model quietly answers a nearby
+# question instead. The fix is to write the request down as a SHORT SPEC first, hand the
+# model nothing but that while it builds, and then check the file against it.
+# ---------------------------------------------------------------------------------------
+_SPEC: dict = {}          # chat_id -> {"items": [...], "ts": ...}
+# The spec costs one small model call per build request. Set SPEC_ENABLED=false to skip it
+# (the file is then built with no written brief, which is what drifted in the first place).
+SPEC_ENABLED = (os.environ.get("SPEC_ENABLED", "true").strip().lower()
+                in ("1", "true", "yes", "on"))
+_SPEC_TTL = float(os.environ.get("SPEC_TTL", "1800") or "1800")
+_SPEC_STOP = {"the", "and", "for", "with", "that", "this", "from", "into", "should", "must",
+              "have", "will", "make", "made", "page", "pages", "file", "files", "html",
+              "website", "using", "use", "all", "any", "not", "but", "are", "was", "each",
+              "every", "some", "their", "there", "which", "when", "what", "also", "just",
+              "like", "same", "same", "very", "only", "then", "than", "them", "they"}
+
+
+async def _build_spec(chat_id, text: str) -> list:
+    """The concrete things this person asked to be BUILT, as short bullets.
+
+    One small model call, and the result is the only brief the builder gets - which is
+    what stops it from wandering off into a different product.
+    """
+    if not text or len(text) < 8:
+        return []
+    try:
+        out = await ask_gemini(
+            chat_id,
+            "List ONLY what this person asked to be BUILT, as short bullets.\n"
+            "Request: " + text[:800] + "\n\n"
+            "Rules: max 8 bullets, one concrete thing each (a page/section, a feature, a "
+            "file type, a language, a content requirement). No solutions, no code, no "
+            "design opinions, no extra ideas. If they named a site to copy, say which.",
+            _guard("=== SPEC EXTRACTION (do not build anything here) ===\n"
+                   "Return 3-8 short bullets, each starting with '- '. Only what they "
+                   "asked for. Never add something they did not ask for. No preamble."))
+    except Exception as e:  # noqa: BLE001
+        log.debug("spec call failed: %s", str(e)[:100])
+        return []
+    items = []
+    for ln in (out or "").splitlines():
+        ln = re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s*", "", ln).strip()
+        if 3 <= len(ln) <= 160 and not ln.lower().startswith(("here", "sure", "spec")):
+            items.append(ln)
+    items = items[:8]
+    if len(items) >= 2:
+        _SPEC[chat_id] = {"items": items, "ts": time.time()}
+        log.info("build spec for chat %s: %s", chat_id, " | ".join(items)[:300])
+        return items
+    return []
+
+
+def _spec_items(chat_id) -> list:
+    rec = _SPEC.get(chat_id)
+    if not rec or (time.time() - rec.get("ts", 0)) > _SPEC_TTL:
+        _SPEC.pop(chat_id, None)
+        return []
+    return rec.get("items") or []
+
+
+def _spec_audit(items: list, body: str) -> list:
+    """Which spec bullets the file does not seem to honour at all."""
+    low = (body or "").lower()
+    if not low or not items:
+        return []
+    missing = []
+    for it in items[:8]:
+        words = [w for w in re.findall(r"[a-zA-Z\u0900-\u097F]{4,}", it.lower())
+                 if w not in _SPEC_STOP]
+        if len(words) < 2:
+            continue
+        hit = sum(1 for w in set(words) if w in low)
+        if hit / len(set(words)) < 0.5:
+            missing.append(it)
+    return missing
+
+
 async def _polish_html(chat_id, name: str, body: str, request: str,
                        rounds: int = 2) -> tuple:
     """(body, note). Hand the model its own page back with the concrete faults, up to twice.
@@ -3490,8 +3603,15 @@ async def _polish_html(chat_id, name: str, body: str, request: str,
         return body, ""
     if not _WEB_ASK_RE.search(request or ""):
         return body, ""
+    _spec = _spec_items(chat_id)
     for _i in range(max(1, rounds)):
         blocking, minor = _html_audit(body, request)
+        if _spec:
+            _miss = _spec_audit(_spec, body)
+            if _miss:
+                blocking = blocking + [f"they asked for \"{m}\" and it is not in the file"
+                                       for m in _miss[:4]]
+                log.info("spec audit: %s of %s items missing", len(_miss), len(_spec))
         if not blocking:
             if minor:
                 log.info("page %s passed the audit (minor: %s)", name, "; ".join(minor[:3]))
@@ -3530,6 +3650,9 @@ async def _polish_html(chat_id, name: str, body: str, request: str,
             log.warning("polish failed: %s", str(e)[:120])
             break
     blocking, minor = _html_audit(body, request)
+    if _spec:
+        blocking = blocking + [f"they asked for \"{m}\"" for m in
+                               _spec_audit(_spec, body)[:3]]
     # "a bit short" is not a fault worth alarming the person about - it is a note.
     soft = [b for b in blocking if b.startswith("there is almost no readable content")]
     hard = [b for b in blocking if b not in soft]
@@ -5451,6 +5574,23 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                             "open it.")
                     log.info("link could not be read for chat %s", chat_id)
 
+            # ---- THE SPEC (what they actually asked for) ------------------------
+            # Written down BEFORE the build, so the file is made to this list and nothing
+            # else. This is the fix for "I asked for X and it built something random".
+            if (SPEC_ENABLED and text
+                    and (_file_wanted(text) or _WEB_ASK_RE.search(text))
+                    and action_allowed(chat_id, "file")):
+                _spec_items_now = await _build_spec(chat_id, text)
+                if _spec_items_now:
+                    ctx += ("\n\n=== BUILD EXACTLY THIS (their own words, as a spec) ===\n"
+                            + "\n".join("- " + s for s in _spec_items_now) +
+                            "\n\nBuild THIS and only this. Every bullet must be "
+                            "visible in the file. Do not add features, pages or ideas "
+                            "that are not on this list. Do not change the subject, the "
+                            "product or the audience. If a bullet says to copy a site, "
+                            "reproduce that site's structure and sections - not a "
+                            "generic look-alike.")
+
             # ---- IMAGES THE LINK READERS FOUND ----------------------------------
             # A video thumbnail or a post's picture, fetched while reading the link. They
             # have to be merged HERE: _read_links() runs above, so popping the stash any
@@ -5482,9 +5622,14 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # A "make it like <site>" / "same to same" request is a RESEARCH task before
             # it is a coding task: the model cannot reproduce a layout it has never seen.
             # So the reference is fetched first, and the file is written with it in view.
-            if (RESEARCH_ENABLED and text and _WEB_ASK_RE.search(text)
-                    and _CLONE_RE.search(text) and action_allowed(chat_id, "search")):
-                _q = re.sub(r"\s+", " ", text)[:120] + " homepage sections layout"
+            _clone_target = _clone_target_of(text)
+            if (RESEARCH_ENABLED and _clone_target
+                    and (_WEB_ASK_RE.search(text) or _file_wanted(text))
+                    and action_allowed(chat_id, "search")):
+                # Search the SITE, not the whole sentence. Searching the sentence pulled
+                # in unrelated Wikipedia pages, which then steered the build somewhere
+                # else entirely - the drift the person noticed.
+                _q = _clone_target + " homepage sections layout what is on the page"
                 _ref = _untrusted(await free_web_search(_q, 4))
                 if _ref:
                     ctx += ("\n\n=== REFERENCE RESEARCH (fetched now) ===\n" + _ref +
@@ -6252,7 +6397,8 @@ def _find_key(obj, key: str, out: list, depth: int = 0) -> None:
 _DDG_HEADERS = {"User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://lite.duckduckgo.com/"}
 _DDG_LAST = 0.0          # epoch of the last DDG request (for the throttle below)
-_DDG_MIN_GAP = 1.5       # minimum seconds between two DDG requests
+# 1.5s was too fast: the second query of a burst was already soft-blocked.
+_DDG_MIN_GAP = float(os.environ.get("DDG_MIN_GAP", "3.0") or "3.0")
 
 
 # ---- Resilient fetch layer ---------------------------------------------------------------
@@ -6606,6 +6752,19 @@ def _strip_html(s: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s or "")).strip()
 
 
+# DuckDuckGo soft-blocks an IP after a couple of quick queries: the FIRST request of a
+# burst answers 200, the next ones answer 202 with a bot-check page and no results. Measured
+# exactly that (POST lite -> 200 result-link=True, then the very next call -> nothing).
+# When that happens the old code fell through to Wikipedia, so a "how is a YouTube homepage
+# laid out" lookup came back as encyclopedia text - which is why research looked broken.
+# Bing's RSS output was tried as a second backend and REJECTED: the same query came back
+# as Aadhaar pages, Chinese forum posts and a "Bing homepage quiz" - a decoy page. A
+# decoy is worse than nothing, so there is no second search engine here on purpose.
+_DDG_BLOCKED_UNTIL = 0.0
+_DDG_BAD_RUNS = 0
+DDG_COOLDOWN = float(os.environ.get("DDG_COOLDOWN", "120") or "120")
+
+
 async def _ddg_lite_html(query: str) -> str:
     """Fetch DuckDuckGo's results page as HTML, with retries.
 
@@ -6615,7 +6774,9 @@ async def _ddg_lite_html(query: str) -> str:
     """
     # Be gentle: DDG soft-blocks (HTTP 202) an IP that fires requests too fast, so space our
     # own requests out. This is a big part of why lookups used to come back empty.
-    global _DDG_LAST
+    global _DDG_LAST, _DDG_BLOCKED_UNTIL, _DDG_BAD_RUNS
+    if time.time() < _DDG_BLOCKED_UNTIL:
+        return ""                      # we are in a soft-block window - do not add to it
     gap = _DDG_MIN_GAP - (time.time() - _DDG_LAST)
     if gap > 0:
         await asyncio.sleep(gap)
@@ -6633,6 +6794,7 @@ async def _ddg_lite_html(query: str) -> str:
                                     data={"q": query}, headers=_DDG_HEADERS)
             body = r.text or ""
             if r.status_code == 200 and "result-link" in body:
+                _DDG_BAD_RUNS = 0
                 return body
             if r.status_code in (202, 429, 403):
                 await asyncio.sleep(0.8 * (attempt + 1))   # soft rate-limit / bot check
@@ -6642,6 +6804,12 @@ async def _ddg_lite_html(query: str) -> str:
         except Exception as e:  # noqa: BLE001
             log.debug("ddg lite attempt %s failed: %s", attempt, str(e)[:100])
             await asyncio.sleep(0.6)
+    # every attempt came back empty/blocked -> stop hammering DDG for a while
+    _DDG_BAD_RUNS += 1
+    if _DDG_BAD_RUNS >= 2:
+        _DDG_BLOCKED_UNTIL = time.time() + DDG_COOLDOWN
+        log.warning("DuckDuckGo is soft-blocking this IP - pausing it for %ss",
+                    int(DDG_COOLDOWN))
     return ""
 
 
@@ -6810,6 +6978,14 @@ def _social_plan(url: str):
     if host in _X_HOSTS and m:
         return ("x", f"https://api.fxtwitter.com/{m.group(1)}/status/{m.group(2)}", hdrs)
 
+    # ---- any platform with a public oEmbed endpoint
+    for suffix, base in _OEMBED.items():
+        if host == suffix or host.endswith("." + suffix):
+            return ("oembed", base + urllib.parse.quote(url, safe=""), hdrs)
+    # ---- Open Graph only (Instagram, Facebook, LinkedIn, Threads, Snapchat, ...)
+    for suffix in _OG_ONLY:
+        if host == suffix or host.endswith("." + suffix):
+            return ("og", url, hdrs)
     # ---- Telegram: a public channel's web preview, or one post's embed
     if host in _TG_HOSTS:
         m = re.match(r"^/s/([A-Za-z0-9_]{3,})/?$", path)
@@ -6977,6 +7153,49 @@ def _parse_tg_web(h: str) -> str:
     return head + ":\n" + "\n---\n".join(texts[:5])
 
 
+# Platforms with a PUBLIC oEmbed endpoint (no key, no login). One JSON call gives the
+# title, the author, the text and a thumbnail - and the thumbnail is handed to the model
+# as an image, so the answer can be about what is actually on screen.
+_OEMBED = {
+    "vimeo.com": "https://vimeo.com/api/oembed.json?url=",
+    "dailymotion.com": "https://www.dailymotion.com/services/oembed?url=",
+    "dai.ly": "https://www.dailymotion.com/services/oembed?url=",
+    "soundcloud.com": "https://soundcloud.com/oembed?format=json&url=",
+    "open.spotify.com": "https://open.spotify.com/oembed?url=",
+    "pinterest.com": "https://www.pinterest.com/oembed.json?url=",
+    "pinterest.co.uk": "https://www.pinterest.com/oembed.json?url=",
+    "imgur.com": "https://api.imgur.com/oembed.json?url=",
+    "slideshare.net": "https://www.slideshare.net/api/oembed/2?format=json&url=",
+    "flickr.com": "https://www.flickr.com/services/oembed/?format=json&url=",
+    "kickstarter.com": "https://www.kickstarter.com/services/oembed?url=",
+}
+# Platforms that publish nothing but Open Graph - the card IS the data. The picture is
+# still worth looking at, so the og:image is fetched and shown to the model.
+_OG_ONLY = ("instagram.com", "facebook.com", "fb.watch", "linkedin.com", "threads.net",
+            "threads.com", "snapchat.com", "tumblr.com", "twitch.tv", "rumble.com",
+            "twitter.com", "x.com", "reddit.com", "medium.com", "quora.com")
+
+
+def _parse_oembed(js: dict) -> str:
+    """A public oEmbed card: title, author, description, and the thumbnail URL."""
+    if not isinstance(js, dict):
+        return ""
+    bits = []
+    if js.get("title"):
+        bits.append("title: " + _clean(js.get("title"), 200))
+    who = js.get("author_name") or js.get("provider_name") or ""
+    if who:
+        bits.append("author: " + _clean(who, 80))
+    if js.get("description"):
+        bits.append("description: " + _clean(js.get("description"), 900))
+    if js.get("provider_name"):
+        bits.append("platform: " + _clean(js.get("provider_name"), 40))
+    thumb = js.get("thumbnail_url") or ""
+    if thumb:
+        bits.append("thumbnail URL: " + thumb)
+    return "\n".join(bits)
+
+
 _SOCIAL_PARSERS = {
     "reddit": _parse_reddit, "mastodon": _parse_mastodon, "bluesky": _parse_bluesky,
     "tiktok": _parse_tiktok, "x": _parse_x, "tg_channel": _parse_tg_web, "tg_post": _parse_tg_web,
@@ -6998,11 +7217,28 @@ async def _social_context(url: str, chat_id: int = 0) -> str:
             out = _parse_tg_web(r.text)
         elif kind == "reddit_rss":
             out = _parse_reddit_rss(r.text)
+        elif kind == "og":
+            meta = _og_meta(r.text or "")
+            img = re.search(r'property=["\']og:image["\']\s+content=["\']([^"\']+)',
+                            r.text or "") or re.search(
+                r'content=["\']([^"\']+)["\']\s+property=["\']og:image', r.text or "")
+            if img and chat_id:
+                await _stash_link_image(chat_id, img.group(1), "the post's image")
+            out = meta
+        elif kind == "oembed":
+            try:
+                js = r.json()
+            except Exception:  # noqa: BLE001
+                js = None
+            out = _parse_oembed(js) if js else _og_meta(r.text or "")
+            if js and chat_id and js.get("thumbnail_url"):
+                await _stash_link_image(chat_id, js["thumbnail_url"], "the post's thumbnail")
         else:
             try:
                 js = r.json()
             except Exception:  # noqa: BLE001
-                return ""
+                # not JSON: fall back to the page's own card instead of returning nothing
+                return _og_meta(r.text or "") if r.text else ""
             out = _SOCIAL_PARSERS[kind](js)
         if out:
             log.info("social post read (%s): %s chars", kind, len(out))
