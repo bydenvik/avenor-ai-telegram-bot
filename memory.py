@@ -288,48 +288,52 @@ def user_summary(user_id) -> str:
 
     Everything here is user-controlled, so every field goes through safe_mem().
     """
-    load()
-    u = _DATA["users"].get(str(user_id))
-    if not u:
-        return ""
-    bits = [f"name: {safe_mem(u.get('name'), 60) or '?'} (ID {user_id})"]
-    if u.get("username"):
-        bits.append(f"username: @{safe_mem(u['username'], 40)}")
-    if u.get("language"):
-        bits.append(f"usually writes in: {safe_mem(u['language'], 20)}")
-    bits.append(f"messages seen: {u.get('msgs', 0)}")
-    if u.get("first_seen"):
-        bits.append("first seen: " + time.strftime("%d %b %Y", time.localtime(u["first_seen"])))
-    ai = u.get("ai") or {}
-    if ai:
-        top = sorted(ai.items(), key=lambda kv: -kv[1])[:3]
-        bits.append("AI they mention: " + ", ".join(f"{safe_mem(k, 30)} ({v})" for k, v in top))
-    prof = safe_mem(u.get("profile"), MAX_PROFILE_LEN)
-    if prof:
-        bits.append("profile: " + prof)
-    likes = [safe_mem(x, 150) for x in (u.get("likes") or [])]
-    likes = [x for x in likes if x]
-    if likes:
-        bits.append("notes about them: " + "; ".join(likes))
-    return "What you remember about this person - " + " | ".join(bits) + "."
+    with _LOCK:
+        load()
+        u = _DATA["users"].get(str(user_id))
+        if not u:
+            return ""
+        bits = [f"name: {safe_mem(u.get('name'), 60) or '?'} (ID {user_id})"]
+        if u.get("username"):
+            bits.append(f"username: @{safe_mem(u['username'], 40)}")
+        if u.get("language"):
+            bits.append(f"usually writes in: {safe_mem(u['language'], 20)}")
+        bits.append(f"messages seen: {u.get('msgs', 0)}")
+        if u.get("first_seen"):
+            bits.append("first seen: " + time.strftime("%d %b %Y", time.localtime(u["first_seen"])))
+        ai = u.get("ai") or {}
+        if ai:
+            top = sorted(ai.items(), key=lambda kv: -kv[1])[:3]
+            bits.append("AI they mention: " + ", ".join(f"{safe_mem(k, 30)} ({v})" for k, v in top))
+        prof = safe_mem(u.get("profile"), MAX_PROFILE_LEN)
+        if prof:
+            bits.append("profile: " + prof)
+        likes = [safe_mem(x, 150) for x in (u.get("likes") or [])]
+        likes = [x for x in likes if x]
+        if likes:
+            bits.append("notes about them: " + "; ".join(likes))
+        return "What you remember about this person - " + " | ".join(bits) + "."
 
 
 # ---------------------------------------------------- per-user profile / compaction
 def raw_notes(user_id) -> list:
     """The stored raw facts about ONE user (sanitized) - input to the compaction job."""
-    load()
-    u = _DATA["users"].get(str(user_id)) or {}
-    return [safe_mem(x, MAX_NOTE_LEN) for x in (u.get("likes") or []) if safe_mem(x, MAX_NOTE_LEN)]
+    with _LOCK:
+        load()
+        u = _DATA["users"].get(str(user_id)) or {}
+        return [safe_mem(x, MAX_NOTE_LEN) for x in (u.get("likes") or []) if safe_mem(x, MAX_NOTE_LEN)]
 
 
 def notes_count(user_id) -> int:
-    load()
-    return len((_DATA["users"].get(str(user_id)) or {}).get("likes") or [])
+    with _LOCK:
+        load()
+        return len((_DATA["users"].get(str(user_id)) or {}).get("likes") or [])
 
 
 def get_profile(user_id) -> str:
-    load()
-    return str((_DATA["users"].get(str(user_id)) or {}).get("profile") or "")
+    with _LOCK:
+        load()
+        return str((_DATA["users"].get(str(user_id)) or {}).get("profile") or "")
 
 
 def set_profile(user_id, text) -> bool:
@@ -478,37 +482,40 @@ def count_reminders(user_id) -> int:
 
 def user_basic(user_id) -> str:
     """Short public line for a normal user: name, ID, and when they joined."""
-    load()
-    u = _DATA["users"].get(str(user_id))
-    if not u:
-        return ""
-    joined = (time.strftime("%d %b %Y", time.localtime(u["first_seen"]))
-              if u.get("first_seen") else "?")
-    return f"{u.get('name', '?')} (ID {user_id}) - you joined on {joined}."
+    with _LOCK:
+        load()
+        u = _DATA["users"].get(str(user_id))
+        if not u:
+            return ""
+        joined = (time.strftime("%d %b %Y", time.localtime(u["first_seen"]))
+                  if u.get("first_seen") else "?")
+        return f"{u.get('name', '?')} (ID {user_id}) - you joined on {joined}."
 
 
 def all_users() -> list:
     """Every remembered user, most active first (for the owner view)."""
-    load()
-    out = [{"id": uid, "name": u.get("name", "?"), "username": u.get("username"),
-            "language": u.get("language"), "msgs": u.get("msgs", 0),
-            "first_seen": u.get("first_seen"), "likes": u.get("likes") or [],
-            "profile": u.get("profile") or "",
-            "ai": u.get("ai") or {}}
-           for uid, u in _DATA["users"].items()]
-    out.sort(key=lambda x: -(x.get("msgs") or 0))
-    return out
+    with _LOCK:
+        load()
+        out = [{"id": uid, "name": u.get("name", "?"), "username": u.get("username"),
+                "language": u.get("language"), "msgs": u.get("msgs", 0),
+                "first_seen": u.get("first_seen"), "likes": u.get("likes") or [],
+                "profile": u.get("profile") or "",
+                "ai": u.get("ai") or {}}
+               for uid, u in _DATA["users"].items()]
+        out.sort(key=lambda x: -(x.get("msgs") or 0))
+        return out
 
 
 def all_chats() -> list:
     """Every remembered chat, most active first (for the owner view)."""
-    load()
-    out = [{"id": cid, "type": c.get("type"), "title": c.get("title"),
-            "language": c.get("language"), "msgs": c.get("msgs", 0),
-            "first_seen": c.get("first_seen")}
-           for cid, c in _DATA["chats"].items()]
-    out.sort(key=lambda x: -(x.get("msgs") or 0))
-    return out
+    with _LOCK:
+        load()
+        out = [{"id": cid, "type": c.get("type"), "title": c.get("title"),
+                "language": c.get("language"), "msgs": c.get("msgs", 0),
+                "first_seen": c.get("first_seen")}
+               for cid, c in _DATA["chats"].items()]
+        out.sort(key=lambda x: -(x.get("msgs") or 0))
+        return out
 
 
 def top_ai(user_id) -> str:
@@ -554,8 +561,9 @@ def set_chat_flag(chat_id, key: str, value) -> None:
 
 
 def get_chat(chat_id) -> dict:
-    load()
-    return _DATA["chats"].get(str(chat_id), {}) or {}
+    with _LOCK:
+        load()
+        return _DATA["chats"].get(str(chat_id), {}) or {}
 
 
 def chats_with_flag(key: str, value=True) -> list:
@@ -567,37 +575,41 @@ def chats_with_flag(key: str, value=True) -> list:
 
 
 def chat_summary(chat_id) -> str:
-    load()
-    c = _DATA["chats"].get(str(chat_id))
-    if not c:
-        return ""
-    bits = [f"type: {c.get('type', '?')}"]
-    if c.get("title"):
-        bits.append(f"title: {safe_mem(c['title'], 80)}")   # group titles are user-controlled too
-    if c.get("language"):
-        bits.append(f"usual language: {safe_mem(c['language'], 20)}")
-    bits.append(f"messages seen here: {c.get('msgs', 0)}")
-    if c.get("first_seen"):
-        bits.append("first seen: " + time.strftime("%d %b %Y", time.localtime(c["first_seen"])))
-    return "Chat memory - " + " | ".join(bits) + "."
+    with _LOCK:
+        load()
+        c = _DATA["chats"].get(str(chat_id))
+        if not c:
+            return ""
+        bits = [f"type: {c.get('type', '?')}"]
+        if c.get("title"):
+            bits.append(f"title: {safe_mem(c['title'], 80)}")   # group titles are user-controlled too
+        if c.get("language"):
+            bits.append(f"usual language: {safe_mem(c['language'], 20)}")
+        bits.append(f"messages seen here: {c.get('msgs', 0)}")
+        if c.get("first_seen"):
+            bits.append("first seen: " + time.strftime("%d %b %Y", time.localtime(c["first_seen"])))
+        return "Chat memory - " + " | ".join(bits) + "."
 
 
 # ----------------------------------------------------------------------- admin
 def get_user(user_id) -> dict:
-    load()
-    return _DATA["users"].get(str(user_id), {}) or {}
+    with _LOCK:
+        load()
+        return _DATA["users"].get(str(user_id), {}) or {}
 
 
 def all_notes(user_id) -> list:
     """The stored facts about a user (used to personalise proactive messages)."""
-    load()
-    u = _DATA["users"].get(str(user_id)) or {}
-    return list(u.get("likes") or [])
+    with _LOCK:
+        load()
+        u = _DATA["users"].get(str(user_id)) or {}
+        return list(u.get("likes") or [])
 
 
 def stats() -> dict:
-    load()
-    return {"users": len(_DATA["users"]), "chats": len(_DATA["chats"])}
+    with _LOCK:
+        load()
+        return {"users": len(_DATA["users"]), "chats": len(_DATA["chats"])}
 
 
 def forget(user_id) -> bool:

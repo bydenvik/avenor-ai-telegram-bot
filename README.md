@@ -218,6 +218,22 @@ not rediscover it the hard way.
   SQLite; the accessor functions in `memory.py` are the seam to swap.
 - **A voice reply sends the text as well by default.** Set `VOICE_ALSO_TEXT=false` for
   voice-only if the text feels like a duplicate of what you just heard.
+- **The JSON store is single-instance, by design.** Every write and now every read takes one
+  lock, so concurrent handlers cannot lose an update or trip
+  `RuntimeError: dictionary changed size during iteration` (that second one was real: the
+  readers were unlocked until this was fixed, and a 50-writer stress test reproduced it).
+  It is still one process on one disk — running two instances against the same file will
+  not work. The accessors in `memory.py` are the seam to swap for SQLite/Postgres if that
+  day comes.
+- **Bot API baseline: 10.0** (what `python-telegram-bot` 22.8 speaks). Bot API 10.1 added
+  *rich messages* — tables, headings, collapsible details, 32k characters — and 10.3 added
+  *stoppable drafts* and ephemeral messages. This bot does not use them: 22.8 has no
+  `send_rich_message`, and shipping a raw call I could not test against Telegram would risk
+  breaking every reply. Rich messages are the single biggest formatting upgrade available
+  once the library supports them.
+- **Guest mode is available but not wired up.** Bot API 10.0 lets a bot answer a mention in
+  a chat it is not a member of (`guest_message` → `answerGuestQuery`); 22.8 exposes both.
+  Nothing handles it yet, so a guest mention is ignored rather than answered badly.
 - **Generated code is checked, not executed.** Syntax and structure are validated locally;
   the bot never runs model-written code on its own host, because a prompt injection could
   then make it run anything. Running it safely needs a separate disposable container, which
@@ -227,6 +243,11 @@ not rediscover it the hard way.
   else runs on the host. When that is used up the README is still read straight from
   `raw.githubusercontent.com` (which is not rate-limited the same way), so a link still
   resolves to real content.
+- **Text fetched from the web is untrusted and is treated that way.** Action tags
+  (`[remember:]`, `[file:]`, `[search:]`) are stripped out of every page, post and search
+  snippet before it reaches the model, so a page cannot ask the bot to store a fact, write
+  a file or burn a lookup. It cannot stop the model from *believing* a false claim on a
+  page — read the answer with that in mind.
 - **Social reading is best-effort.** The X, Reddit, Mastodon, Bluesky, TikTok and Telegram
   endpoints are public and undocumented for this use, so any of them can rate-limit, change
   shape, or block a datacenter IP without notice. Every one of them falls back to the page's
