@@ -1,6 +1,6 @@
 # Privacy Policy — Avenor (Telegram bot @AvenorAlBot)
 
-*Last updated: 30 October 2026*
+*Last updated: 1 November 2026*
 
 This policy explains, in plain language, what Avenor ("the bot", "we", "us") does with
 information when you message it. It is written to match what the bot actually does — nothing
@@ -38,6 +38,13 @@ Kept only in memory (RAM) while the bot is running, and **not** written to stora
   after the chat has been idle for a while
 - Media you send (photos, voice notes, files) is processed to answer you and is not kept by
   the bot afterwards
+
+When a file or link is shared in a **group**, the bot checks it for malware before anyone is
+answered: a text/script file is downloaded (up to `SAFETY_MAX_SCAN_BYTES`, 512 KB by default)
+and matched against known-bad patterns, and links are checked for a raw IP host, a hidden
+destination, an executable download or a look-alike domain. Nothing from that check is stored
+beyond a one-line entry in the admin-only `/safety` log (who, why, when), and the file itself is
+discarded immediately.
 
 We do **not** ask for your phone number, email, contacts or precise location, and we never
 store them. If you choose to *send* a contact card or a location, its contents are used to

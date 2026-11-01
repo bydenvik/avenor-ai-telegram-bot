@@ -140,6 +140,8 @@ All runtime settings come from environment variables. See `env.example.txt` for 
 
 `/rules` `/setup` `/welcome` `/stats` `/members` — group tools (admin-only where marked)
 
+`/safety` — spam + malicious-file rules and the last few blocks (admin-only)
+
 `/diag` `/voicecreate` `/voicelist` `/voicefind` — owner only
 
 Everything else works without a command: send a photo, a voice note, a document, a link,
@@ -190,6 +192,54 @@ Memory is kept per user, keyed by their Telegram ID, and only ever injected into
 - Set `GROQ_API_KEY`, or Gemini rate limits leave the bot replying "busy".
 - Run exactly **one** instance. Two instances cause `telegram.error.Conflict` and dropped messages.
 - Free services sleep after ~15 minutes idle. Ping `/health` every 5 minutes from an uptime monitor to keep it awake (this also keeps memory alive).
+
+---
+
+## Group safety
+
+Two guards run on every group message. Both are plain code — no model call — so they cost
+nothing, cannot be argued with, and cannot be talked out of it by the message itself.
+
+**Spam guard** (`SPAM_GUARD`, on by default). A single message is never enough: the bot adds
+up signals over a rolling 30-second window and only acts at a score of 4.
+
+| Signal | Points |
+|---|---|
+| 12+ messages in the window | 5 |
+| 8+ messages in the window | 2 |
+| The same text 3x (only if it is 12+ characters) | 4 |
+| 4+ links in a row | 4 |
+| 3 links in a row | 2 |
+| 4+ forwards in a row | 4 |
+| 3 forwards in a row | 2 |
+| SHOUTING (70%+ caps in a 20+ letter message) | 1 |
+| More than 12 emoji | 1 |
+| A 10+ repeated-character run | 1 |
+
+So a normal member saying "haan / haan / haan" scores 0, a lively 10-message burst scores 2,
+and a promo posted three times scores 4 and is removed. Escalation is deliberately slow and
+reversible: **first time** delete + a short warning, **second time** a 10-minute mute, **third
+time** a longer mute — or a 24-hour ban if you set `SPAM_ACTION=ban`. The owner and group
+admins are exempt, private chats are never affected, and a bot that is not an admin simply
+cannot delete (the owner still gets told).
+
+**Malicious file / link scan** (`SAFETY_SCAN`, on by default). Two confidence levels, and
+only HIGH deletes anything:
+
+- HIGH — a file name ending in `.exe .scr .bat .cmd .vbs .ps1 .msi .dll .lnk .hta .docm .xlsm
+  .pptm`, a double extension (`invoice.pdf.exe`), a crack/keygen/wallet-scam name; file content
+  with an encoded PowerShell command, `curl … | bash`, `eval(atob(…))`, `rm -rf /`, a fork bomb,
+  a seed-phrase request, a hidden iframe, or a form posting to a raw IP; and links that go to a
+  raw IP, hide their host (`paypal.com@evil.tld`), download an executable, or pair a shortener
+  with scam words. → deleted, with a notice and a DM to the owner.
+- MEDIUM — punycode domains, a bare shortener, a deep subdomain chain, a long encoded blob, an
+  archive or an `.apk`/`.jar` (people share these on purpose). → the owner is told, nothing is
+  deleted.
+
+`/safety` prints these rules and the last few detections, so an admin can see exactly why
+something was removed. Both guards are conservative by design: deleting a real member's file
+is worse than letting one bad file through, which is why `.apk`, `.jar` and archives are only
+reported.
 
 ---
 
