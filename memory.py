@@ -29,14 +29,10 @@ _log = logging.getLogger("avenor")
 
 MEMORY_FILE = (os.environ.get("MEMORY_FILE") or
                os.path.join(os.path.dirname(os.path.abspath(__file__)), "avenor_memory.json"))
-# Renaming the bot must NOT throw away memory that was already saved under the old name.
-# Every name this bot has ever shipped under, NEWEST FIRST. The first one that exists is
-# read and then rewritten under the current name, so a rename never looks like "all my
-# memory vanished". Order matters: a deployment that ran both names keeps the newest.
-_LEGACY_MEMORY_FILES = [
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "videx_memory.json"),
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "linnet_memory.json"),
-]
+# Renaming the bot must NOT throw away memory that was already saved under the old name,
+# so the loader still understands a list of previous file names (newest first). It is
+# empty today because this bot has only ever shipped as Avenor.
+_LEGACY_MEMORY_FILES = []      # no pre-rename files to migrate; kept for the loader path
 # 0 = UNLIMITED (no cap). Every new user / chat automatically gets its own entry.
 MAX_NOTES = int(os.environ.get("MEMORY_MAX_NOTES", "0") or "0")
 MAX_NOTE_LEN = int(os.environ.get("MEMORY_MAX_NOTE_LEN", "300") or "300")

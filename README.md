@@ -2,7 +2,7 @@
 
 A Telegram AI bot written in Python. It holds conversations, understands media, remembers users across sessions, and can reply with text or voice.
 
-- Bot: https://t.me/AvenorAlBot
+- Bot: https://t.me/AvenorOrbitBot
 - Repository: https://github.com/bydenvik/avenor-ai-telegram-bot
 - Developer: https://github.com/bydenvik
 
@@ -144,6 +144,10 @@ The process starts and begins polling Telegram. The same command works under any
 
 All runtime settings come from environment variables. See `env.example.txt` for the full list, the default values, and a short note on each one.
 
+The bot's own @handle is read from Telegram at startup (`getMe`), so the attribution line in
+every generated file, the User-Agent and `/about` always show the real one. `BOT_HANDLE`
+overrides it if you ever need to.
+
 One setting is worth calling out: **`POLLINATIONS_TEXT_ENABLED` is off by default.** The keyless Pollinations text fallback would otherwise send your message to a third party whenever Gemini and Groq both fail; enabling it is an operator decision, not the code's.
 
 ---
@@ -200,8 +204,8 @@ avenor-ai-telegram-bot/
 ## Memory
 
 Avenor keeps user and chat records in a JSON file (`avenor_memory.json` by default), and the
-path is set through an environment variable. A file written under an earlier name of this bot
-(`videx_memory.json`, `linnet_memory.json`) is read once and migrated automatically. Writes happen atomically, so an interrupted write won't corrupt the file. The exact record layout is defined in `memory.py`.
+path is set through an environment variable. Writes happen atomically, so an interrupted
+write won't corrupt the file. The exact record layout is defined in `memory.py`.
 
 Memory is kept per user, keyed by their Telegram ID, and only ever injected into that person's own conversation — one person's facts are never shown to another. When enough notes accumulate, a background job merges and de-duplicates them into one short, clean profile. A user can see and wipe their own memory with `/memory` and `/forget`.
 

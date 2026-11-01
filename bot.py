@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Deepak Danodia (https://github.com/bydenvik)
-# VIDEX integrity 7f3a9c1e - do not remove
+# Avenor integrity 7f3a9c1e - do not remove
 """
 Avenor AI — Telegram Chatbot  (production-grade single file)
 ============================================================
@@ -465,8 +465,8 @@ except ImportError:  # pragma: no cover
     TG_TEXT_LIMIT = 4096
 
 
-# The logger name lives in ONE constant. It used to be a literal that survived two renames
-# as "linnet", so every log line named a bot that no longer exists.
+# The logger name lives in ONE constant, so a future rename cannot leave stale names
+# scattered through the log lines.
 LOG_NAME = "avenor"
 
 
@@ -1217,10 +1217,8 @@ WELCOME_CAPTION = (
     "Make yourself at home. If you have any questions, just drop a message. "
     "See you in the chat."
 )
-# NOTE: this used to be rendered in Unicode mathematical-bold (\U0001d5d4-style glyphs).
-# That looked decorative and broke three things: it defeated every plain-text search for
-# the bot's name, screen readers read the letters out one by one, and it hid a two-rename-
-# old name ("Linnet AI") from the last rename audit. Plain text on purpose.
+# Plain text on purpose: Unicode decorative glyphs (\U0001d5d4-style) defeated every
+# plain-text search for the bot's name and screen readers read them letter by letter.
 
 # ============================ PART 5: LOGGING, CLIENT, MEMORY ============================
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -2665,31 +2663,6 @@ def _caption_for_attachment(text: str, filename: str) -> str:
     return f"📎 `{filename}` — ready."
 
 
-def _strip_repeated_file_text(text: str, bodies: list) -> str:
-    """Drop visible text that merely repeats what is now inside the attached file.
-
-    The reply used to carry the file AND the entire file content as a chat message - on a
-    7 KB page that is a wall of HTML on a phone. If most of the visible lines also appear in a
-    body we just attached, the text is redundant and is removed.
-    """
-    t = (text or "").strip()
-    if not t or not bodies:
-        return t
-    hay = "\n".join(bodies)
-    lines = [ln.strip() for ln in t.splitlines() if len(ln.strip()) > 25]
-    if not lines:
-        return t
-    hits = sum(1 for ln in lines if ln in hay)
-    if hits / len(lines) >= 0.5:
-        return ""
-    if len(t) > 600:
-        cut = t[:600]
-        for sep in (". ", "! ", "? ", "\n"):
-            if sep in cut:
-                cut = cut[:cut.rfind(sep) + 1]
-                break
-        return cut.rstrip() + "\n\n(Full version attached.)"
-    return t
 _VOICE_TAG_RE = re.compile(r"\[\s*(?:voice|voicereply|voice reply)\s*\]", re.I)
 _AUTO_IMAGE_RE = re.compile(r"\[\s*image\s*:\s*([^\]]{3,300})\]", re.I)
 
@@ -2727,6 +2700,41 @@ _IMAGE_WANT_RE = re.compile(
     re.I)
 # A reply must be at least this long before it is turned into a file automatically.
 FILE_FALLBACK_MIN = int(os.environ.get("FILE_FALLBACK_MIN", "400") or "400")
+
+# A whole document pasted into a chat message is a failure, not an answer: on a phone it is
+# a wall of source code and Telegram splits it across several messages. This recognises one
+# so the caller can turn it into a file instead of dumping it.
+_DOC_START_RE = re.compile(
+    r"^\s*(?:<!doctype\s+html|<html\b|<head\b|<body\b|<\?xml|<\?php|#!|\{\s*[\"\w])",
+    re.I)
+
+
+def _looks_like_full_file(text: str) -> bool:
+    """True when a reply IS a document (html/json/script), not a snippet inside prose."""
+    t = (text or "").strip()
+    if len(t) < 700:
+        return False
+    if _DOC_START_RE.match(t):
+        return True
+    lines = [ln for ln in t.splitlines() if ln.strip()]
+    if len(lines) < 20:
+        return False
+    codey = sum(1 for ln in lines if re.search(r"[;{}<>]\s*$|^\s{2,}\S", ln))
+    low = t.lower()
+    return (codey / len(lines) > 0.6
+            and ("<style" in low or "function " in low or "def " in low or "</" in low))
+
+
+def _file_blocked_msg(lang: str) -> str:
+    return _msg(lang,
+                en="I built it, but I cannot send another file to this chat this second. "
+                   "Ask again in a moment and I will attach it - I am not going to paste a "
+                   "whole document into the chat.",
+                hi="फ़ाइल बन गई, पर अभी इस chat में दूसरी file भेजने की limit है. थोड़ी देर बाद "
+                   "फिर कहिए - मैं पूरा document chat में paste नहीं करूँगा.",
+                hinglish="File ban gayi, par abhi is chat me doosri file bhejne ki limit "
+                         "hai. Thodi der baad phir kaho - main poora document chat me "
+                         "paste nahi karunga.")
 
 
 def _file_requested(text: str) -> bool:
@@ -3073,11 +3081,6 @@ def _needs_live(text: str) -> bool:
     return bool(_FRESH_Q_RE.search(text) and _QUESTION_RE.search(text))
 
 
-def _looks_like_question(text: str) -> bool:
-    """A question in any supported language/script - used where only the shape matters."""
-    return bool(_QUESTION_SHAPE_RE.search(text or ""))
-
-
 # The model's classic excuse - if we see it, we fetch and ask again rather than shipping it.
 _NO_ACCESS_RE = re.compile(
     r"real[- ]?time\s+(data|access|info|market)|live\s+(data|access)|"
@@ -3401,7 +3404,6 @@ async def _fatten_if_thin(chat_id, name: str, body: str, request_text: str) -> t
     except Exception as e:  # noqa: BLE001
         log.warning("thin-file rebuild failed: %s", str(e)[:120])
     return body, ""
-
 
 
 # ---------------------------------------------------------------------------------------
@@ -3730,7 +3732,6 @@ def _edit_context(chat_id: int, text: str) -> str:
             "restart from scratch and do not shrink it.\n")
 
 
-
 # ---- an actual picture of the page (optional; needs a browser on the host) --------------
 # Everything else here is text. If the host has a headless Chromium (playwright), the bot can
 # take a real screenshot of the page it just wrote and SHOW it - which is the honest version
@@ -3810,7 +3811,7 @@ def _attribution_line(name: str) -> str:
     in the file's own syntax survives copy-paste and is what real tools do.
     """
     ext = _ext(name)
-    tag = "Generated with Avenor (t.me/AvenorAlBot)"
+    tag = f"Generated with Avenor (t.me/{_handle()})"
     if ext == "sql":
         return f"-- {tag}\n"
     if ext in ("py", "sh", "yaml", "yml", "toml", "ini", "cfg"):
@@ -4473,9 +4474,10 @@ def back_menu() -> InlineKeyboardMarkup:
 WELCOME = ("👋 *Welcome!* I'm Avenor.\n\n"
            "Tap a button below, or just *type anything and send* - I'll answer using AI.\n"
            "You can also send me a *photo*, a *voice note*, or a *PDF*.")
-ABOUT = ("🤖 *About*\n\nI'm *Avenor* - an AI assistant created by Deepak Danodia.\n"
-         "Source: https://github.com/bydenvik/avenor-ai-telegram-bot (MIT)\n"
-         "Menu buttons *+* AI answers, both. Running 24/7.")
+def _about_text() -> str:
+    return ("🤖 *About*\n\nI'm *Avenor* - an AI assistant created by Deepak Danodia.\n"
+            f"Source: https://github.com/bydenvik/avenor-ai-telegram-bot (MIT)\n"
+            f"Bot: @{_handle()} - menu buttons *+* AI answers, both. Running 24/7.")
 HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/about - about the bot\n/skills - what I can do, with examples\n"
         "/info - your name, ID, chat, members, date\n"
@@ -4583,7 +4585,8 @@ async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_about(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    await u.message.reply_text(ABOUT, parse_mode="Markdown", reply_markup=back_menu())
+    await u.message.reply_text(_about_text(), parse_mode="Markdown",
+                                   reply_markup=back_menu())
 
 
 async def cmd_rules(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5809,6 +5812,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             file_note = ""
             filed_name = ""
             dropped_files = 0
+            file_blocked = False
             for fm in list(_FILE_BLOCK_RE.finditer(ans or ""))[:2]:
                 fname, fbody = fm.group(1).strip(), fm.group(2)
                 ans = (ans or "").replace(fm.group(0), "").strip()
@@ -5822,6 +5826,11 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     dropped_files += 1
                     continue
                 if not action_allowed(chat_id, "file"):
+                    # Rate-limited / capped. Remember it, so the reply does not fall
+                    # through to "paste the whole document into the chat".
+                    file_blocked = True
+                    log.info("file action blocked for chat %s - not pasting the document",
+                             chat_id)
                     continue
                 body, note = await _validate_and_repair(chat_id, fname, fbody)
                 body, thin_note = await _fatten_if_thin(chat_id, fname, body, text)
@@ -5851,6 +5860,37 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         _remember_file(chat_id, fname, body)
                         await _send_preview(c.bot, chat_id, fname, body)
                         ans = (ans or "")[:mo.start()].strip()
+            # ---- NEVER PASTE A WHOLE DOCUMENT INTO THE CHAT ----------------------
+            # The screenshot case: the model wrote the page inline, or the file action was
+            # rate-limited, so the reply was the raw HTML. Turn it into a file if we still
+            # can, and say so plainly if we cannot.
+            if not file_sent and _looks_like_full_file(ans or ""):
+                _dfname = _guess_filename(text or "", ans or "")
+                log.info("reply looks like a whole document (%s chars) - attaching as %s",
+                         len(ans or ""), _dfname)
+                if action_allowed(chat_id, "file"):
+                    _dbody, _dnote = await _validate_and_repair(chat_id, _dfname, ans or "")
+                    _dbody, _dthin = await _fatten_if_thin(chat_id, _dfname, _dbody, text)
+                    _dbody, _dpolish = await _polish_html(chat_id, _dfname, _dbody, text)
+                    if await send_made_file(c.bot, chat_id, _dfname, _dbody):
+                        file_sent = True
+                        filed_name = _dfname
+                        filed_bodies.append(_dbody)
+                        _remember_file(chat_id, _dfname, _dbody)
+                        await _send_preview(c.bot, chat_id, _dfname, _dbody)
+                        ans = _caption_for_attachment(ans or "", _dfname)
+                        if _dnote or _dthin or _dpolish:
+                            ans = (ans + "\n\n" + (_dnote or _dthin or _dpolish)).strip()
+                    else:
+                        file_blocked = True
+                if not file_sent:
+                    ans = _file_blocked_msg(lang)
+            # The model DID write a [file:] block but we could not deliver it. Say so - never
+            # leave the person with a reply that mentions a file they never received.
+            if file_blocked and not file_sent and (ans or "").strip():
+                _fb = _file_blocked_msg(lang)
+                if _fb not in ans:
+                    ans = ans.rstrip() + "\n\n" + _fb
             if dropped_files and not file_sent:
                 # Nothing was attached, so nothing may say "open it".
                 cleaned = _strip_attachment_claims(ans)
@@ -6069,7 +6109,8 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     elif d == "menu":
         await q.edit_message_text(WELCOME, parse_mode="Markdown", reply_markup=main_menu())
     elif d == "about":
-        await q.edit_message_text(ABOUT, parse_mode="Markdown", reply_markup=back_menu())
+        await q.edit_message_text(_about_text(), parse_mode="Markdown",
+                                      reply_markup=back_menu())
     elif d == "help":
         await q.edit_message_text(HELP, parse_mode="Markdown", reply_markup=back_menu())
     elif d == "skills":
@@ -6358,7 +6399,24 @@ _PROACTIVE_PENDING: set = set()
 # Two different user agents on purpose - the two sites want opposite things:
 #   * DuckDuckGo serves its lite page to a normal BROWSER agent (a bot-looking agent is
 _UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
-_UA_BOT = "AvenorBot/1.0 (Telegram assistant; +https://t.me/AvenorAlBot)"
+# The bot's own @handle. It used to be typed into three different strings (the file
+# attribution, the User-Agent and /about) and had already drifted from the live bot - so
+# every generated file carried a link that went nowhere. It is now resolved at runtime from
+# getMe, with BOT_HANDLE as an override for the first seconds of a cold start.
+_BOT_HANDLE = ""
+
+
+def _handle() -> str:
+    return (_BOT_HANDLE
+            or os.environ.get("BOT_HANDLE", "").strip().lstrip("@")
+            or "AvenorAlBot")
+
+
+def _ua_bot() -> str:
+    return f"AvenorBot/1.0 (Telegram assistant; +https://t.me/{_handle()})"
+
+
+_UA_BOT = _ua_bot()      # kept as a module constant for the plain headers
 # YouTube, Reddit, TikTok and X all answer a bot User-Agent with 403/429 and a browser
 # one with the data. Measured: reddit .json -> 403 with both, reddit .rss -> 200 with a
 # Chrome UA and 429 with the bot UA. So the social/YouTube path always looks like a
@@ -6885,11 +6943,6 @@ def _ddg_lite_lines(html: str, n: int) -> list:
         if t:
             out.append(f"- {t}: {s[:260]}")
     return out
-
-
-async def _ddg_lite(query: str, n: int) -> list:
-    """DuckDuckGo's 'lite' endpoint - the one that actually still answers."""
-    return _ddg_lite_lines(await _ddg_lite_html(query), n)
 
 
 async def _wikipedia(query: str, n: int = 3) -> list:
@@ -8421,9 +8474,18 @@ async def _post_init(app) -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("delete_webhook failed (ignored): %s", e)
     _APP_BOT = app.bot
+    global _BOT_HANDLE
+    try:
+        _BOT_HANDLE = (getattr(app.bot, "username", "") or "").lstrip("@")
+        if _BOT_HANDLE:
+            log.info("bot handle resolved: @%s", _BOT_HANDLE)
+    except Exception as e:  # noqa: BLE001
+        log.debug("could not read the bot username: %s", e)
     app.create_task(_cleanup_loop())
     app.create_task(_proactive_loop(app.bot))          # no-op unless opted in
     app.create_task(_reminder_loop())                  # delivers reminders when due
+    global _UA_BOT
+    _UA_BOT = _ua_bot()
     await _setup_commands(app)
     _READY = True                                      # /ready starts answering 200
 
@@ -9067,7 +9129,6 @@ def resolve_models() -> None:
         log.warning("resolve_models failed (ignored): %s", e)
 
 
-
 # ============================ PART 17b: GROUP SAFETY ============================
 # Two jobs, both deterministic (no model call, so they cost nothing and cannot be talked
 # out of it by the message itself):
@@ -9669,7 +9730,7 @@ def _verify_notice() -> None:
     # check, because the verifier's own copy is not written as one contiguous string.
     required = ("SPDX-License" "-Identifier: MIT",
                 "Copyright (c) 2026 " "Deepak " "Danodia",
-                "VIDEX integrity " "7f3a9c1e")
+                "Avenor integrity " "7f3a9c1e")
     if not all(x and x in head for x in required):
         raise SystemExit(
             "Refusing to start: the licence header (SPDX / copyright / integrity marker) in "

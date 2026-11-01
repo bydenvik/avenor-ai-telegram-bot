@@ -1,4 +1,4 @@
-# Privacy Policy — Avenor (Telegram bot @AvenorAlBot)
+# Privacy Policy — Avenor (Telegram bot @AvenorOrbitBot)
 
 *Last updated: 1 November 2026*
 
@@ -8,7 +8,7 @@ here is aspirational.
 
 ## 1. Who we are
 
-Avenor is a personal/community AI assistant that runs as a Telegram bot at **@AvenorAlBot**.
+Avenor is a personal/community AI assistant that runs as a Telegram bot at **@AvenorOrbitBot**.
 The developer is Deepak Danodia (https://github.com/bydenvik). Contact:
 **contact.officialdeepak@gmail.com**.
 
