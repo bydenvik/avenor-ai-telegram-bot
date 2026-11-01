@@ -144,6 +144,8 @@ The process starts and begins polling Telegram. The same command works under any
 
 All runtime settings come from environment variables. See `env.example.txt` for the full list, the default values, and a short note on each one.
 
+One setting is worth calling out: **`POLLINATIONS_TEXT_ENABLED` is off by default.** The keyless Pollinations text fallback would otherwise send your message to a third party whenever Gemini and Groq both fail; enabling it is an operator decision, not the code's.
+
 ---
 
 ## Commands
@@ -286,16 +288,20 @@ reported.
 These are known and accepted, not oversights. Each one is here so a future maintainer does
 not rediscover it the hard way.
 
-- **DNS rebinding window.** Every outbound fetch validates the URL structurally, resolves the
-  host and rejects any private/loopback/link-local answer, and re-validates every redirect hop.
-  The HTTP client then resolves the name again, so a hostile DNS server with a very short TTL
-  could in principle answer public for our check and private for the connection. Pinning the
-  connection to the validated IP was considered and rejected: it bypasses the egress proxy that
-  many hosts (and most corporate networks) require, which would break every fetch. The impact
-  is limited because the bot reaches no internal services. When the process cannot resolve
-  names itself at all (a proxy doing the DNS, a container with no resolver) the host check
-  falls back to the structural check and the request proceeds - refusing there does not add
-  safety, it just disables every lookup, which is the worse failure.
+- **DNS rebinding window.** Every outbound fetch checks the scheme, rejects credentials in
+  the URL, rejects loopback/private/link-local/reserved addresses (IPv4 and IPv6), restricts
+  the **port** to a web allowlist (`SSRF_ALLOWED_PORTS`, default 80/443/8080/8443 — so a
+  Redis, a Postgres or an SSH port is refused before any DNS lookup), resolves the host and
+  rejects the request if *any* answer is non-public, and re-checks every redirect hop. On a
+  DNS **timeout** the request is now refused **once our own resolver has proved it works for
+  other hosts** (`SSRF_DNS_STRICT`); on a host where the resolver never works — an egress
+  proxy doing the DNS — it stays permissive, because failing closed there disables every
+  fetch and protects nothing.
+  What remains open is the gap between the check and the connection: the HTTP client
+  resolves the name again, so a hostile DNS server with a very short TTL could in principle
+  answer public for our check and private for the connection. Closing that needs the checked
+  address pinned to the socket, which means bypassing the egress proxy and re-implementing
+  TLS SNI/Host handling — rejected deliberately, and not something a one-line change can fix.
 - **Single-instance only.** State lives in one JSON file, so two polling processes would
   overwrite each other and Telegram would return `Conflict`. One instance per token.
 - **The JSON store does not scale indefinitely.** It is rewritten as a whole file, which is

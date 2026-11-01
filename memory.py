@@ -47,7 +47,13 @@ MAX_PROFILE_LEN = int(os.environ.get("MEMORY_MAX_PROFILE_LEN", "900") or "900")
 # Max pending reminders per user (0 = unlimited).
 MAX_REMINDERS = int(os.environ.get("MEMORY_MAX_REMINDERS", "50") or "50")
 
-_LOCK = threading.Lock()
+# RLock, NOT Lock: load() can trigger a migration, the migration calls save(force=True),
+# and _flush() then takes this same lock again - from the same thread. With a plain Lock
+# that is a permanent deadlock, and 12 getters (user_basic, raw_notes, all_users, ...)
+# call load() while already holding it. Reproduced in a subprocess: the call never
+# returned. RLock makes the re-entry legal; it is the same mutual exclusion for everyone
+# else.
+_LOCK = threading.RLock()
 # The store carries an explicit schema version so a future shape change is a migration
 # step rather than a code change. v0 = every file written before this field existed.
 SCHEMA_VERSION = 1
@@ -82,8 +88,8 @@ def _migrate() -> bool:
     return changed
 
 
-def load() -> None:
-    """Load the memory file once (safe to call many times)."""
+def _load_unlocked() -> None:
+    """The body of load(). MUST be called with _LOCK held (or before any thread exists)."""
     global _LOADED
     if _LOADED:
         return
@@ -126,6 +132,16 @@ def load() -> None:
         # A transient read error must NOT poison the process for its whole lifetime - leave
         # _LOADED False so the next call retries instead of running on an empty store.
         _log.error("memory load failed (%s) - will retry on the next call: %s", MEMORY_FILE, e)
+
+
+def load() -> None:
+    """Load the store once, with the lock held.
+
+    Holding the lock across the whole initialisation also stops two threads from loading the
+    same old file at the same time and each writing its own idea of the initial state.
+    """
+    with _LOCK:
+        _load_unlocked()
 
 
 _DIRTY = False

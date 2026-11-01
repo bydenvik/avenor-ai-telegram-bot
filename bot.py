@@ -1182,6 +1182,17 @@ GROQ_SYS = (
 )
 
 
+# A numeric Telegram ID is an identity key. The fallback providers get a trimmed context
+# only so they can answer; they have no use for the number, so it is removed first.
+_CTX_TGID_RE = re.compile(
+    r"\s*[\(\[]?\b(?:telegram\s+)?(?:user\s+)?id[:\s]+\d{5,}\b[\)\]]?", re.I)
+
+
+def _third_party_ctx(context: str, limit: int = 900) -> str:
+    """The compact context for Groq/Pollinations, with identity numbers stripped."""
+    return _short_ctx(_CTX_TGID_RE.sub("", context or ""), limit)
+
+
 def _short_ctx(context: str, limit: int = 900) -> str:
     """Trim the LIVE CONTEXT block for the Groq fallback (its 8k tokens/min free budget).
     The first lines - date/time, who is speaking, language, voice mode - are the ones that
@@ -1266,6 +1277,13 @@ IMAGE_RATIOS = {"square": (1, 1), "tall": (2, 3), "portrait": (2, 3),
 # Tertiary, no-key text fallback (used only when Gemini AND Groq both fail).
 POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/openai"
 POLLINATIONS_TEXT_MODEL = os.environ.get("POLLINATIONS_TEXT_MODEL", "openai").strip() or "openai"
+# OPT-IN, OFF BY DEFAULT. This path sends the user's message and a compact slice of their
+# context to a third-party service that needs no key and no account, and it used to do so
+# silently whenever Gemini AND Groq both failed. Whether that is acceptable is the
+# operator's decision, not the code's: set POLLINATIONS_TEXT_ENABLED=true to allow it.
+# Image generation (a prompt the bot itself wrote) is separate and still on.
+POLLINATIONS_TEXT_ENABLED = (os.environ.get("POLLINATIONS_TEXT_ENABLED", "false")
+                             .strip().lower() in ("1", "true", "yes", "on"))
 _LAST_IMAGE: dict = {}       # chat_id -> epoch of the last image (cooldown)
 HTTP_IMG = httpx.AsyncClient(timeout=150)
 
@@ -4239,7 +4257,7 @@ async def ask_gemini(chat_id, prompt_text: str, context: str,
         try:
             # Compact prompt + trimmed context: Groq's free tier is 8k tokens/MINUTE, and the
             # full system prompt alone is ~4.5k tokens, which 429'd the fallback on arrival.
-            g = await ask_groq(GROQ_SYS + "\n\n" + _short_ctx(context), msgs)
+            g = await ask_groq(GROQ_SYS + "\n\n" + _third_party_ctx(context), msgs)
             if g:
                 log.info("Answered via Groq fallback")
                 return g
@@ -4247,15 +4265,17 @@ async def ask_gemini(chat_id, prompt_text: str, context: str,
             last_err = str(e)
             log.warning("Groq failed: %s", str(e)[:150])
 
-    # Tertiary fallback: free, no key. Better than a 'busy' reply.
-    try:
-        p = await ask_pollinations(GROQ_SYS + "\n\n" + _short_ctx(context), msgs)
-        if p:
-            log.info("Answered via Pollinations fallback")
-            return p
-    except Exception as e:  # noqa: BLE001
-        last_err = str(e)
-        log.warning("Pollinations failed: %s", str(e)[:150])
+    # Tertiary fallback: free, no key - but OPT-IN, because it is a third party that
+    # receives the user's text. Off unless POLLINATIONS_TEXT_ENABLED=true.
+    if POLLINATIONS_TEXT_ENABLED:
+        try:
+            p = await ask_pollinations(GROQ_SYS + "\n\n" + _third_party_ctx(context), msgs)
+            if p:
+                log.info("Answered via Pollinations fallback")
+                return p
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)
+            log.warning("Pollinations failed: %s", str(e)[:150])
 
     # Second pass - ONLY when the first one failed almost instantly (a transient blip).
     # Re-walking the SAME chain after it already failed took up to GEMINI_BUDGET again, so a
@@ -5558,7 +5578,10 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                                     _ttl = _ln.split(":", 1)[-1].strip()[:120]
                                     break
                             if _ttl:
-                                MEM.note(u.effective_user.id, "shared link: " + _ttl)
+                                # save() can serialise the whole JSON store; keep that
+                                # off the event loop.
+                                await asyncio.to_thread(MEM.note, u.effective_user.id,
+                                                        "shared link: " + _ttl)
                         except Exception as e:  # noqa: BLE001
                             log.debug("link note failed: %s", e)
                 else:
@@ -5862,7 +5885,8 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 ans = _REMEMBER_TAG_RE.sub("", ans)
                 if MEM is not None:
                     try:
-                        MEM.note(u.effective_user.id, rem.group(1))
+                        await asyncio.to_thread(MEM.note, u.effective_user.id,
+                                                rem.group(1))
                         _maybe_compact_memory(u.effective_user.id)
                     except Exception as e:  # noqa: BLE001
                         log.debug("remember failed: %s", e)
@@ -5872,7 +5896,8 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 due, what = parse_reminder(rmm.group(1))
                 if due and what and MEM is not None:
                     try:
-                        if MEM.add_reminder(u.effective_user.id, chat_id, what, due):
+                        if await asyncio.to_thread(MEM.add_reminder,
+                                                   u.effective_user.id, chat_id, what, due):
                             log.info("reminder set for %s (silent tool)", u.effective_user.id)
                     except Exception as e:  # noqa: BLE001
                         log.debug("remind failed: %s", e)
@@ -6511,10 +6536,33 @@ def _url_is_public(url: str) -> bool:
     if host in ("localhost", "localhost.localdomain") or host.endswith((".local", ".internal")):
         return False
     try:
+        port = p.port
+    except ValueError:            # a malformed port (":99999") is not a URL we will fetch
+        return False
+    if port is None:
+        port = 443 if p.scheme == "https" else 80
+    if SSRF_ALLOWED_PORTS and port not in SSRF_ALLOWED_PORTS:
+        log.debug("fetch: port %s is not on the allowlist (%s)", port, host)
+        return False
+    try:
         return _ip_is_public(ipaddress.ip_address(host.strip("[]")))
     except ValueError:
         return True                       # a name - the DNS check below decides
 
+
+# SSRF: only web ports. An outbound fetch has no business reaching a Redis (6379), a
+# Postgres (5432), an Elasticsearch (9200) or an SSH daemon (22), and those are the usual
+# targets of an SSRF that gets past the address check. This part needs no DNS at all, so
+# it holds even when the resolver is inconclusive.
+SSRF_ALLOWED_PORTS = {int(x) for x in
+                      os.environ.get("SSRF_ALLOWED_PORTS", "80,443,8080,8443")
+                      .split(",") if x.strip().isdigit()}
+# Fail CLOSED on a DNS timeout once our own resolver has proved it works for other hosts.
+# (If it never works - an egress proxy doing the DNS - failing closed would disable every
+# fetch, which is the worse failure and was verified on a real host.)
+SSRF_DNS_STRICT = (os.environ.get("SSRF_DNS_STRICT", "true").strip().lower()
+                   in ("1", "true", "yes", "on"))
+_DNS_WORKS = False        # our own resolver has answered for at least one host
 
 _DNS_OK: dict = {}        # host -> (monotonic, is_public) so we resolve each host once
 _DNS_TTL = 300.0
@@ -6522,6 +6570,7 @@ _DNS_TTL = 300.0
 
 async def _host_is_public(host: str) -> bool:
     """Resolve the name and reject if ANY answer is a non-public address (cached)."""
+    global _DNS_WORKS
     hit = _DNS_OK.get(host)
     if hit and (time.monotonic() - hit[0]) < _DNS_TTL:
         return hit[1]
@@ -6534,14 +6583,22 @@ async def _host_is_public(host: str) -> bool:
         # Plenty of legitimate deployments cannot: an egress proxy does the DNS, a locked-down
         # container has no resolver, a slow resolver misses the timeout. Failing closed here
         # (which an earlier version did) silently disabled EVERY outbound fetch on such a host -
-        # verified, not theoretical. Let it through: if the name genuinely does not resolve, the
-        # HTTP client fails on its own, and if it resolves to a private address the check below
-        # catches it whenever our own resolver CAN answer. Not cached, so a later attempt tries
-        # the real resolution again.
+        # verified, not theoretical.
+        #
+        # So the answer is ADAPTIVE, not unconditional: once our own resolver has answered for
+        # some other host, we know it works here, and a timeout for THIS host stops being
+        # innocent - that is exactly the shape of a resolver being played with. Then we fail
+        # closed. On a host where our resolver never works we keep the old behaviour, because
+        # refusing there disables every lookup and protects nothing.
+        if _DNS_WORKS and SSRF_DNS_STRICT:
+            log.warning("dns: timeout resolving %s while our resolver is working - refused",
+                        host)
+            return False
         log.debug("dns: could not resolve %s ourselves - relying on the client", host)
         return True
     except Exception:  # noqa: BLE001  (gaierror: the name does not resolve at all)
         return False
+    _DNS_WORKS = True          # our resolver demonstrably works in this deployment
     if infos:
         for info in infos:
             try:
@@ -8895,6 +8952,8 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              "Free quota (approx): " + ", ".join(
                  f"{m}={MODEL_RPD.get(m, '?')}/day" for m in GEMINI_MODELS[:4]),
              f"🔑 Groq: {bool(GROQ_API_KEY)} (chat fallback + Whisper)",
+             "🌐 Pollinations text fallback: "
+             + ("ON (opt-in)" if POLLINATIONS_TEXT_ENABLED else "off (opt-in only)"),
              f"🖼 Vision: {'on' if client is not None else 'off (no Gemini key)'}",
              f"🔊 TTS: {'on' if client is not None else 'off'} "
              f"(voice: {_chat_voice(u.effective_chat.id)})",

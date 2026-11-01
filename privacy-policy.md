@@ -69,15 +69,16 @@ To generate a reply, the text of your message — and any image, voice note or d
   privacy policy and the Gemini API terms.
 - **Groq** — fallback chat model and speech-to-text (Whisper) when the main one is unavailable.
   See Groq's privacy policy.
-- **Pollinations** — keyless text fallback and image generation, when enabled. See
-  Pollinations' terms.
+- **Pollinations** — image generation, and a keyless text fallback that is **off unless the
+  operator turns it on** (`POLLINATIONS_TEXT_ENABLED=true`). See Pollinations' terms.
 
 Web lookups (for live facts) go to public sources: DuckDuckGo, Wikipedia, Google News and
 RSS feeds for search and news; Yahoo Finance, Stooq, gold-api.com, goldprice.org, a
 jsDelivr-hosted exchange-rate table, open.er-api.com and Binance for prices and rates;
 Open-Meteo for weather and place names; arXiv for papers; nager.at for public holidays; and
 a public dictionary API for word meanings. What is sent is the text of your question (or the
-place you asked about), never your account details.
+place you asked about), never your account details. Your numeric Telegram ID is removed from the context before
+anything is sent to Groq or Pollinations — those providers do not need it.
 
 When you share a link, that page is fetched so the bot can read it. For links to social posts
 and code hosting, the public endpoints of the same platform are used instead of the page
