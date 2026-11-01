@@ -63,6 +63,7 @@ import os
 import io
 import ast
 import base64
+import hashlib
 import operator
 import re
 import urllib.parse
@@ -890,7 +891,15 @@ SYSTEM_PROMPT = (
     "something long or structured they will want to KEEP or reuse: notes, a plan, a "
     "checklist, a table, code, a draft, a config. Not for a normal chat answer, and not for "
     "anything shorter than ~15 lines. Extensions: md, txt, csv, json, py, html, xml, yaml, "
-    "sql, js, css. Keep it under ~300 lines.\n"
+    "sql, js, css, yaml. Length is not capped - write the whole thing, however long it needs "
+    "to be; just do not pad it.\n"
+    "   ONLY when they asked for a file, document, code, script, website or page. NEVER for an "
+    "analysis, a question, a summary, a review or a repository check - those are answered in "
+    "the chat, not attached.\n"
+    "   AFTER the [/file] line write at most TWO short lines: what the file is and how to use "
+    "it. NEVER paste the file's content into the chat as well - the person already has the "
+    "file, and a wall of code on a phone is unreadable. The bot checks the file's syntax "
+    "before sending it, so if it reports a problem, fix it and send the corrected file.\n"
     "3. [voice] - send this reply as a voice note instead of text. Use it sparingly, only "
     "when hearing it beats reading it (a short warm line, a story, a pronunciation, casual "
     "voice chat). Never on ordinary informational answers.\n"
@@ -2275,6 +2284,46 @@ async def ask_pollinations(system: str, messages: list) -> str:
 # Avenor can decide BY ITSELF, from the message alone, to attach a file, send a voice note,
 _FILE_BLOCK_RE = re.compile(
     r"\[\s*file\s*:\s*([^\]\n]{1,60}?)\s*\]\s*(.*?)\s*\[\s*/\s*file\s*\]", re.S | re.I)
+# The model often forgets the closing [/file]. When it does, everything after the opening tag
+# IS the file it meant to write - and the strict regex above does not match, so the whole block
+# used to leak into the chat as a wall of source code. This catches that case.
+_FILE_OPEN_RE = re.compile(r"\[\s*file\s*:\s*([^\]\n]{1,60}?)\s*\]", re.I)
+
+
+def _file_wanted(text: str) -> bool:
+    """Did the person actually ask for a file/document/code?
+
+    The model used to attach a file whenever it felt productive - asked to *check a
+    repository*, it invented an index.html. A file is only sent when the request asks for one.
+    """
+    return _file_requested(text or "")
+
+
+def _strip_repeated_file_text(text: str, bodies: list) -> str:
+    """Drop visible text that merely repeats what is now inside the attached file.
+
+    The reply used to carry the file AND the entire file content as a chat message - on a
+    7 KB page that is a wall of HTML on a phone. If most of the visible lines also appear in a
+    body we just attached, the text is redundant and is removed.
+    """
+    t = (text or "").strip()
+    if not t or not bodies:
+        return t
+    hay = "\n".join(bodies)
+    lines = [ln.strip() for ln in t.splitlines() if len(ln.strip()) > 25]
+    if not lines:
+        return t
+    hits = sum(1 for ln in lines if ln in hay)
+    if hits / len(lines) >= 0.5:
+        return ""
+    if len(t) > 600:
+        cut = t[:600]
+        for sep in (". ", "! ", "? ", "\n"):
+            if sep in cut:
+                cut = cut[:cut.rfind(sep) + 1]
+                break
+        return cut.rstrip() + "\n\n(Full version attached.)"
+    return t
 _VOICE_TAG_RE = re.compile(r"\[\s*(?:voice|voicereply|voice reply)\s*\]", re.I)
 _AUTO_IMAGE_RE = re.compile(r"\[\s*image\s*:\s*([^\]]{3,300})\]", re.I)
 
@@ -2284,12 +2333,13 @@ _AUTO_IMAGE_RE = re.compile(r"\[\s*image\s*:\s*([^\]]{3,300})\]", re.I)
 _FILE_EXT_RE = re.compile(
     r"([A-Za-z0-9][A-Za-z0-9._\-]{0,40}\.(?:md|txt|csv|json|py|html|xml|yaml|yml|sql|js|css))\b",
     re.I)
-_FILE_NOUN = (r"(?:file|document|report|notes?|story|script|code|csv|json|checklist|draft|"
-              r"plan|resume|letter|essay|table|spreadsheet|"
-              r"फाइल|फ़ाइल|दस्तावेज़|रिपोर्ट|नोट्स|लिखो|तालिका)")
+_FILE_NOUN = (r"(?:file|document|report|notes?|story|script|code|program|snippet|csv|json|"
+              r"checklist|draft|plan|resume|letter|essay|table|spreadsheet|"
+              r"website|webpage|site|page|html|landing|dashboard|template|app|application|"
+              r"फाइल|फ़ाइल|दस्तावेज़|रिपोर्ट|नोट्स|लिखो|तालिका|वेबसाइट)")
 _FILE_VERB = (r"(?:bana|banao|banaye|banaao|banado|bana\s*do|create|make|write|generate|save|"
-              r"download|attach|export|dedo|de\s*do|likho|likh\s*do|"
-              r"बनाओ|बनाइए|लिखो|लिखिए|सेव|भेजो)")
+              r"download|attach|export|dedo|de\s*do|likho|likh\s*do|chahiye|chaiye|"
+              r"बनाओ|बनाइए|लिखो|लिखिए|सेव|भेजो|चाहिए)")
 _FILE_WANT_RE = re.compile(
     r"\.(?:md|txt|csv|json|py|html|xml|yaml|yml|sql|js|css)\b"
     r"|" + _FILE_NOUN + r"[^.\n]{0,40}?" + _FILE_VERB +
@@ -2692,7 +2742,7 @@ _ACTION_DAY: dict = {}        # (chat_id, kind) -> (day_key, count)
 
 ALLOWED_FILE_EXT = {"md", "txt", "csv", "json", "py", "html", "xml", "yaml", "yml",
                     "log", "ini", "cfg", "sql", "sh", "js", "css", "tsv"}
-MAX_FILE_BYTES = 400 * 1024
+MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(2 * 1024 * 1024)) or str(2 * 1024 * 1024))
 
 
 def action_allowed(chat_id: int, kind: str) -> bool:
@@ -2735,7 +2785,17 @@ def safe_filename(name: str, fallback: str = "avenor_file.txt") -> str:
 async def send_made_file(bot, chat_id: int, name: str, content: str) -> bool:
     """Send AI-written text as a real file attachment."""
     try:
-        data = (content or "").strip().encode("utf-8")[:MAX_FILE_BYTES]
+        body = (content or "").strip()
+        tag = _attribution_line(safe_filename(name))
+        if tag and tag.strip() not in body:
+            # HTML: a comment before <!DOCTYPE> is legal but some validators complain, so it
+            # goes immediately after the doctype instead.
+            if tag.startswith("<!--") and body[:15].lower().startswith("<!doctype"):
+                cut = body.find(">")
+                body = body[:cut + 1] + "\n" + tag + body[cut + 1:].lstrip()
+            else:
+                body = tag + body
+        data = body.strip().encode("utf-8")[:MAX_FILE_BYTES]
         if not data:
             return False
         await rate_gate(chat_id)
@@ -2746,6 +2806,206 @@ async def send_made_file(bot, chat_id: int, name: str, content: str) -> bool:
     except Exception as e:  # noqa: BLE001
         log.warning("send_document failed: %s", e)
         return False
+
+
+# ============================ PART 13b: GENERATED-CODE CHECKS ============================
+# Code handed to a person should not arrive broken. Every generated file is syntax-checked
+# before it is attached; if the check fails the model gets one chance to repair it, and if it
+# still fails the person is told honestly instead of being handed a file that will not run.
+#
+# What this deliberately does NOT do: execute the model's code. Running arbitrary model output
+# on the same host as the bot is remote code execution by prompt injection - a web page or a
+# document could ask the model to write a script that phones home. Syntax/structural validation
+# catches the real failure mode (unbalanced tags, broken JSON, a stray indentation) without
+# that risk. Arithmetic is already exact through safe_calc().
+
+_VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+              "param", "source", "track", "wbr"}
+
+
+def _balanced(text: str, pairs="{}[]()") -> str:
+    """Return the first unbalanced bracket as 'opener at line N', or '' if balanced."""
+    stack = []
+    opening = set(pairs[0::2])
+    closing = set(pairs[1::2])
+    line = 1
+    in_str = None
+    esc = False
+    for ch in text:
+        if ch == "\n":
+            line += 1
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == in_str:
+                in_str = None
+            continue
+        if ch in "'\"":
+            in_str = ch
+            continue
+        if ch in opening:
+            stack.append((ch, line))
+        elif ch in closing:
+            if not stack:
+                return f"unexpected '{ch}' on line {line}"
+            op, ln = stack.pop()
+            if pairs.index(op) // 2 != pairs.index(ch) // 2:
+                return f"'{op}' opened on line {ln} but closed with '{ch}' on line {line}"
+    if stack:
+        op, ln = stack[-1]
+        return f"'{op}' opened on line {ln} is never closed"
+    return ""
+
+
+def _check_html(text: str) -> str:
+    from html.parser import HTMLParser
+
+    class Checker(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.stack = []
+            self.problem = ""
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in _VOID_TAGS:
+                self.stack.append((tag, self.getpos()[0]))
+
+        def handle_endtag(self, tag):
+            if tag in _VOID_TAGS:
+                return
+            if not self.stack:
+                self.problem = self.problem or f"</{tag}> closes nothing (line {self.getpos()[0]})"
+                return
+            open_tag, line = self.stack.pop()
+            if open_tag != tag:
+                self.problem = (self.problem or
+                                f"<{open_tag}> on line {line} is closed by </{tag}> "
+                                f"on line {self.getpos()[0]}")
+
+    c = Checker()
+    try:
+        c.feed(text)
+        c.close()
+    except Exception as e:  # noqa: BLE001
+        return f"HTML does not parse: {str(e)[:120]}"
+    if c.problem:
+        return c.problem
+    if c.stack:
+        tag, line = c.stack[-1]
+        return f"<{tag}> opened on line {line} is never closed"
+    return ""
+
+
+def _check_csv(text: str) -> str:
+    import csv
+    import io
+    try:
+        rows = [r for r in csv.reader(io.StringIO(text)) if r]
+    except Exception as e:  # noqa: BLE001
+        return f"CSV does not parse: {str(e)[:120]}"
+    if not rows:
+        return "CSV is empty"
+    width = len(rows[0])
+    for i, r in enumerate(rows[1:], start=2):
+        if len(r) != width:
+            return f"line {i} has {len(r)} columns, header has {width}"
+    return ""
+
+
+def validate_file(name: str, content: str) -> str:
+    """'' when the file looks structurally sound, else a short reason. Pure."""
+    ext = _ext(name)
+    body = content or ""
+    if not body.strip():
+        return "the file is empty"
+    if ext == "json":
+        try:
+            json.loads(body)
+        except Exception as e:  # noqa: BLE001
+            return f"JSON does not parse: {str(e)[:140]}"
+        return ""
+    if ext == "py":
+        try:
+            compile(body, name or "generated.py", "exec")
+        except SyntaxError as e:
+            return f"Python syntax error on line {e.lineno}: {e.msg}"
+        except Exception as e:  # noqa: BLE001
+            return f"Python does not compile: {str(e)[:140]}"
+        return ""
+    if ext in ("yml", "yaml"):
+        try:
+            import yaml  # noqa: PLC0415
+            yaml.safe_load(body)
+        except ImportError:
+            return ""                     # no parser available - do not block the file
+        except Exception as e:  # noqa: BLE001
+            return f"YAML does not parse: {str(e)[:140]}"
+        return ""
+    if ext in ("html", "htm"):
+        return _check_html(body)
+    if ext == "csv":
+        return _check_csv(body)
+    if ext == "css":
+        return _balanced(body, "{}")
+    if ext == "js":
+        return _balanced(body, "{}[]()")
+    if ext == "sql":
+        return _balanced(body, "()")
+    return ""                              # md / txt / others: nothing to validate
+
+
+async def _validate_and_repair(chat_id, name: str, content: str) -> tuple:
+    """(content, note). Ask the model once to repair a broken file."""
+    problem = validate_file(name, content)
+    if not problem:
+        return content, ""
+    log.info("generated file %s failed validation: %s", name, problem)
+    try:
+        fix = await ask_gemini(
+            chat_id,
+            f"The file {name} you just wrote is broken: {problem}.\\n"
+            f"Return the COMPLETE corrected file only, inside a single "
+            f"[file: {name}] ... [/file] block, with no commentary.",
+            _guard("=== BROKEN FILE TO REPAIR ===\\n"
+                   "Fix exactly the reported problem and return the whole file again. "
+                   "Do not shorten it, do not add explanation."))
+        m = _FILE_BLOCK_RE.search(fix or "") or None
+        if m:
+            fixed = m.group(2)
+            problem2 = validate_file(name, fixed)
+            if not problem2:
+                log.info("generated file %s repaired", name)
+                return fixed, ""
+            problem = problem2
+    except Exception as e:  # noqa: BLE001
+        log.warning("file repair failed: %s", str(e)[:120])
+    return content, f"⚠️ Heads-up: this file may not run as-is ({problem})."
+
+
+def _attribution_line(name: str) -> str:
+    """One honest, VISIBLE line naming the tool that generated the file.
+
+    Deliberately not a zero-width watermark: invisible characters break diffs, break some
+    editors and can corrupt a JSON/YAML file, and any regex strips them in one pass. A comment
+    in the file's own syntax survives copy-paste and is what real tools do.
+    """
+    ext = _ext(name)
+    tag = "Generated with Avenor (t.me/AvenorAlBot)"
+    if ext == "sql":
+        return f"-- {tag}\n"
+    if ext in ("py", "sh", "yaml", "yml", "toml", "ini", "cfg"):
+        return f"# {tag}\\n"
+    if ext in ("js", "css", "ts", "json5"):
+        return f"/* {tag} */\\n"
+    if ext in ("html", "htm", "xml", "svg"):
+        return f"<!-- {tag} -->\\n"
+    if ext == "json":
+        return ""                          # a comment would make the JSON invalid
+    if ext == "csv":
+        return ""
+    return f"<!-- {tag} -->\\n"
 
 
 # ============================ PART 13: AI CALL ============================
@@ -3361,7 +3621,8 @@ def back_menu() -> InlineKeyboardMarkup:
 WELCOME = ("👋 *Welcome!* I'm Avenor.\n\n"
            "Tap a button below, or just *type anything and send* - I'll answer using AI.\n"
            "You can also send me a *photo*, a *voice note*, or a *PDF*.")
-ABOUT = ("🤖 *About*\n\nI'm *Avenor* - an AI assistant created by Deepak.\n"
+ABOUT = ("🤖 *About*\n\nI'm *Avenor* - an AI assistant created by Deepak Danodia.\n"
+         "Source: https://github.com/bydenvik/avenor-ai-telegram-bot (MIT)\n"
          "Menu buttons *+* AI answers, both. Running 24/7.")
 HELP = ("❓ *Help / Commands*\n\n/start - restart the bot\n/help - this help\n"
         "/about - about the bot\n/skills - what I can do, with examples\n"
@@ -4307,6 +4568,8 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
     async with turn_lock(chat_id, getattr(u.effective_user, "id", 0)):
         stop_evt = asyncio.Event()
         typing_task = asyncio.create_task(_typing_loop(c.bot, chat_id, stop_evt))
+        progress = _Progress(c.bot, chat_id, _progress_text(lang, text))
+        await progress.arm()
         reacted = False
         try:
             _t0 = time.monotonic()
@@ -4513,12 +4776,43 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # The model may decide, from the message alone, to attach a file, ask for a voice
             auto_image = ""
             file_sent = False
+            filed_bodies: list = []
+            file_note = ""
             for fm in list(_FILE_BLOCK_RE.finditer(ans or ""))[:2]:
                 fname, fbody = fm.group(1).strip(), fm.group(2)
                 ans = (ans or "").replace(fm.group(0), "").strip()
-                if fbody.strip() and action_allowed(chat_id, "file"):
-                    if await send_made_file(c.bot, chat_id, fname, fbody):
+                if not fbody.strip():
+                    continue
+                filed_bodies.append(fbody)
+                # A file is only attached when the person ASKED for one. Asked to check a
+                # repository, the model used to invent an index.html and attach it.
+                if not _file_wanted(text):
+                    log.info("dropped an unrequested [file: %s] for chat %s", fname, chat_id)
+                    continue
+                if not action_allowed(chat_id, "file"):
+                    continue
+                body, note = await _validate_and_repair(chat_id, fname, fbody)
+                if note:
+                    file_note = note
+                if await send_made_file(c.bot, chat_id, fname, body):
+                    file_sent = True
+            # An unclosed [file: ...] block: everything after it was meant to be the file.
+            mo = _FILE_OPEN_RE.search(ans or "")
+            if mo and not file_sent:
+                fname = mo.group(1).strip()
+                body = (ans or "")[mo.end():].strip()
+                if body and _file_wanted(text) and action_allowed(chat_id, "file"):
+                    filed_bodies.append(body)
+                    body, note = await _validate_and_repair(chat_id, fname, body)
+                    if note:
+                        file_note = note
+                    if await send_made_file(c.bot, chat_id, fname, body):
                         file_sent = True
+                        ans = (ans or "")[:mo.start()].strip()
+            if file_sent:
+                ans = _strip_repeated_file_text(ans, filed_bodies)
+                if file_note:
+                    ans = (ans + "\n\n" + file_note).strip()
             if _VOICE_TAG_RE.search(ans or ""):
                 ans = _VOICE_TAG_RE.sub("", ans or "").strip()
                 want_voice = True
@@ -4662,6 +4956,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
         finally:
             stop_evt.set()
             typing_task.cancel()
+            await progress.finish()
             _turn_end(chat_id)
 
 
@@ -5139,6 +5434,67 @@ async def _host_is_public(host: str) -> bool:
                 continue
     _DNS_OK[host] = (time.monotonic(), ok)
     return ok
+
+
+# ============================ PART 12e: WORKING BUBBLE ============================
+class _Progress:
+    """A short 'working on it…' bubble that deletes itself when the answer arrives.
+
+    Long turns (a lookup, a link read, a file) used to give no feedback at all beyond the
+    typing indicator, so it looked stuck. This posts one small line after a couple of seconds
+    and removes it again before the real answer lands - so the chat never keeps it.
+    """
+
+    def __init__(self, bot, chat_id: int, text: str, delay: float = 2.5):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.text = text
+        self.delay = delay
+        self._task = None
+        self._msg = None
+
+    async def arm(self) -> None:
+        if not self.text:
+            return
+        self._task = asyncio.create_task(self._later())
+
+    async def _later(self) -> None:
+        try:
+            await asyncio.sleep(self.delay)
+            await rate_gate(self.chat_id)
+            self._msg = await self.bot.send_message(chat_id=self.chat_id, text=self.text)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.debug("progress bubble failed: %s", str(e)[:100])
+
+    async def finish(self) -> None:
+        """Remove the bubble. Safe to call whether or not it ever appeared."""
+        if self._task is not None and not self._task.done():
+            self._task.cancel()
+        if self._msg is None:
+            return
+        try:
+            await self.bot.delete_message(chat_id=self.chat_id,
+                                          message_id=self._msg.message_id)
+        except Exception as e:  # noqa: BLE001
+            log.debug("could not remove the progress bubble: %s", str(e)[:100])
+        self._msg = None
+
+
+def _progress_text(lang: str, text: str) -> str:
+    """What the bubble says - chosen from what the turn is about to do."""
+    if _file_requested(text or ""):
+        return _msg(lang, en="⏳ Making your file…", hi="⏳ फ़ाइल बन रही है…",
+                    hinglish="⏳ File ban rahi hai…")
+    if _URL_MSG_RE.search(text or ""):
+        return _msg(lang, en="⏳ Reading that link…", hi="⏳ वह link पढ़ा जा रहा है…",
+                    hinglish="⏳ Wo link padh raha hoon…")
+    if _needs_live(text or ""):
+        return _msg(lang, en="⏳ Looking that up…", hi="⏳ देखा जा रहा है…",
+                    hinglish="⏳ Dekh raha hoon…")
+    return _msg(lang, en="⏳ Working on it…", hi="⏳ काम चल रहा है…",
+                hinglish="⏳ Kaam chal raha hai…")
 
 
 class _Fetched:
@@ -6648,6 +7004,9 @@ async def _proactive_loop(bot) -> None:
 
 async def _post_init(app) -> None:
     global _APP_BOT, _READY
+    # Second, later verification: an edit that removes the startup call in main() is still
+    # caught here, because this runs on every boot before any update is handled.
+    _verify_notice()
     # Clear any stale webhook so long polling never conflicts with one.
     try:
         await app.bot.delete_webhook(drop_pending_updates=DROP_PENDING_UPDATES)
@@ -7336,6 +7695,23 @@ def _build_app() -> Application:
     return app
 
 
+# ---- Attribution -------------------------------------------------------------------------
+# Three values in three different places, plus a digest over all of them. Deleting the header
+# comment alone no longer disables the check (the constants are still compared), and editing
+# any one of them breaks the digest. This is deterrence, not security: the source is readable,
+# so someone determined can still strip all of it - see the note in _verify_notice().
+__author__ = "Deepak Danodia"
+__copyright__ = "Copyright (c) 2026 Deepak Danodia"
+__license__ = "MIT"
+_ATTRIBUTION_DIGEST = "51b4dd6bdf3d145f33989bcc25b05f84"
+
+
+def _attribution_ok() -> bool:
+    """True when the author/copyright/licence constants are intact."""
+    joined = "|".join((__author__, __copyright__, __license__, "7f3a9c1e"))
+    return hashlib.sha256(joined.encode()).hexdigest()[:32] == _ATTRIBUTION_DIGEST
+
+
 def _verify_notice() -> None:
     """Refuse to start if the MIT notice, copyright line or integrity marker was stripped.
 
@@ -7346,8 +7722,11 @@ def _verify_notice() -> None:
     try:
         with open(os.path.abspath(__file__), "r", encoding="utf-8", errors="ignore") as f:
             head = "".join(f.readline() for _ in range(15))
-    except Exception:  # noqa: BLE001
-        return
+    except Exception as e:  # noqa: BLE001
+        # FAIL CLOSED. Silently returning here meant an unreadable file skipped the check.
+        raise SystemExit(
+            "Refusing to start: this file's own header could not be read for verification "
+            f"({e}). Restore the MIT notice, or use the code under MIT terms.")
     # Split on purpose: a blanket search-and-replace of these strings cannot neuter the
     # check, because the verifier's own copy is not written as one contiguous string.
     required = ("SPDX-License" "-Identifier: MIT",
@@ -7357,6 +7736,12 @@ def _verify_notice() -> None:
         raise SystemExit(
             "Refusing to start: the licence header (SPDX / copyright / integrity marker) in "
             "this file was removed or changed. Restore it, or use the code under MIT terms.")
+    # Second, independent check: the attribution constants, which live far away from the
+    # header. Removing the header comment alone does not get past this one.
+    if not _attribution_ok():
+        raise SystemExit(
+            "Refusing to start: the author/copyright/licence constants in this file were "
+            "changed. Restore them, or use the code under MIT terms.")
 
 
 def _flush_on_exit() -> None:
