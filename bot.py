@@ -3810,7 +3810,15 @@ def start_health_server() -> None:
         def log_message(self, *args):
             pass
 
-    srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    # No try/except here used to mean a port already in use (a second instance, or a
+    # platform that binds PORT itself) raised OSError out of main() and killed the bot
+    # BEFORE the polling retry loop. The health server is optional; the bot is not.
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as e:
+        log.warning("health server could not bind port %s (%s) - continuing without it",
+                    port, e)
+        return
     srv.daemon_threads = True
     _HEALTH_SRV = srv
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -4172,7 +4180,10 @@ async def cmd_members(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             "I haven't seen any members yet. Names appear as people message or join.")
         return
     lines = [f"👥 *Members I have seen ({len(names)}):*", ""]
-    lines += [f"• {n}" for n in names[:100]]
+    # Display names are USER-CONTROLLED and this message uses legacy Markdown: a member
+    # called "A_B" or "Rahul *pro*" made Telegram reject the whole message ("can't parse
+    # entities") and /members returned nothing at all.
+    lines += [f"• {escape_markdown(str(n), version=1)}" for n in names[:100]]
     if len(names) > 100:
         lines.append(f"…and {len(names) - 100} more")
     lines.append("")
@@ -4445,6 +4456,12 @@ async def on_message(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     # buffer them for a moment and answer ONCE with every image attached.
     mgid = getattr(msg, "media_group_id", None)
     if mgid and media and media.get("kind") == "image":
+        # This branch RETURNS before the _should_answer() check further down, and
+        # _flush_media_group() calls _answer() directly - so in GROUP_MODE=mention an
+        # album with no mention was answered anyway. Check it here too.
+        if not _should_answer(u, c.bot):
+            await _remember_traffic(u, text)
+            return
         buf = _MEDIA_GROUPS.setdefault(mgid, {"u": u, "c": c, "items": [], "task": None})
         buf["items"].append((text, media))
         if buf["task"]:
@@ -4727,7 +4744,12 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
     chat_id = u.effective_chat.id
     _turn_begin(chat_id)          # cap the model calls this ONE message may spend
     is_private = u.effective_chat.type == "private"
-    was_audio = bool(media and media["kind"] == "audio")
+    # `media` is a DICT for one attachment and a LIST for an album (see
+    # _flush_media_group). Indexing a list with "kind" raised TypeError, so every
+    # multi-photo album died before the first model call and the person got nothing.
+    _first_media = (media[0] if isinstance(media, list) and media else media)
+    was_audio = bool(isinstance(_first_media, dict)
+                     and _first_media.get("kind") == "audio")
     speaker = u.effective_user.full_name
     msg = u.effective_message
     forward = describe_forward(msg) if msg else ""
@@ -4834,21 +4856,12 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                             "above: do "
                             "not claim to have seen any part of the page, the repository or the "
                             "post that is not printed here.")
-                else:
-                    # The fetch produced nothing. Say so EXPLICITLY, because the failure mode is
-                    # the model quietly filling the gap and claiming it read the page.
-                    ctx += ("\n\n=== LINK CONTENT: COULD NOT BE READ ===\n"
-                            "The link in the user's message could NOT be fetched (blocked, "
-                            "JavaScript-only, private, or the source was unreachable). You do NOT "
-                            "know what is on it. Say plainly that you could not open it and ask "
-                            "them to paste the text or a screenshot. NEVER describe, summarise or "
-                            "pretend to have checked a page, repository or post you could not "
-                            "read - inventing its contents is worse than saying you could not "
-                            "open it.")
-                    log.info("link could not be read for chat %s", chat_id)
                     log.info("link read for chat %s -> %s chars", chat_id, len(link_text))
                     # Archive a one-line summary of what they shared, so "wo article kya tha"
                     # works days later (it rides along in the user's memory notes).
+                    # This block used to sit in the `else` branch below, where link_text is
+                    # always empty - so the README's "remembers the links you share" never
+                    # actually worked.
                     if MEM is not None:
                         try:
                             _ttl = ""
@@ -4861,6 +4874,18 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                                 MEM.note(u.effective_user.id, "shared link: " + _ttl)
                         except Exception as e:  # noqa: BLE001
                             log.debug("link note failed: %s", e)
+                else:
+                    # The fetch produced nothing. Say so EXPLICITLY, because the failure mode is
+                    # the model quietly filling the gap and claiming it read the page.
+                    ctx += ("\n\n=== LINK CONTENT: COULD NOT BE READ ===\n"
+                            "The link in the user's message could NOT be fetched (blocked, "
+                            "JavaScript-only, private, or the source was unreachable). You do NOT "
+                            "know what is on it. Say plainly that you could not open it and ask "
+                            "them to paste the text or a screenshot. NEVER describe, summarise or "
+                            "pretend to have checked a page, repository or post you could not "
+                            "read - inventing its contents is worse than saying you could not "
+                            "open it.")
+                    log.info("link could not be read for chat %s", chat_id)
 
             # ---- PRE-FLIGHT RESEARCH -------------------------------------------
             # The model frequently answers a live-data question with "I cannot access the
@@ -7435,9 +7460,17 @@ async def cmd_voicecreate(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_voicefind(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    """Search the 2,000+ voice Extended Voice Library (e.g. /voicefind anime, /voicefind soft)."""
+    """Search the 2,000+ voice Extended Voice Library (e.g. /voicefind anime, /voicefind soft).
+
+    OWNER-ONLY, like /voicecreate and /voicelist. The command menu hides it from everyone
+    else and README calls it an owner command, but nothing actually checked - so any member
+    who typed it by hand spent the same free Gemini quota that real replies depend on.
+    """
     if client is None:
         await u.message.reply_text("Voice needs a Gemini key, which is not set.")
+        return
+    if not is_owner(u.effective_user):
+        await u.message.reply_text("That command is owner-only.")
         return
     q = " ".join(c.args).strip() if c.args else ""
     if not q:

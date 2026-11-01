@@ -67,10 +67,16 @@ To generate a reply, the text of your message — and any image, voice note or d
 
 Web lookups (for live facts) go to public sources: DuckDuckGo, Wikipedia, Google News and
 RSS feeds for search and news; Yahoo Finance, Stooq, gold-api.com, goldprice.org, a
-jsDelivr-hosted exchange-rate table and Binance for prices and rates; Open-Meteo for
-weather; arXiv for papers; and a public dictionary API for word meanings. What is sent is
-the text of your question (or the place you asked about), never your account details. When
-you share a link, that page is fetched so the bot can read it.
+jsDelivr-hosted exchange-rate table, open.er-api.com and Binance for prices and rates;
+Open-Meteo for weather and place names; arXiv for papers; nager.at for public holidays; and
+a public dictionary API for word meanings. What is sent is the text of your question (or the
+place you asked about), never your account details.
+
+When you share a link, that page is fetched so the bot can read it. For links to social posts
+and code hosting, the public endpoints of the same platform are used instead of the page
+itself — X/Twitter (via fxtwitter), Reddit, Mastodon, Bluesky, TikTok, public Telegram
+channels, YouTube and GitHub. These are the platforms' own public interfaces, called without
+any account or login of yours.
 
 The bot is hosted on a third-party platform (for example Render). Hosting and its logs are
 governed by that provider's policy.

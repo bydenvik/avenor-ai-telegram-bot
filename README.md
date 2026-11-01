@@ -71,7 +71,9 @@ The bot is meant to run as a long-lived service. It should work on any platform 
 - Python 3.10 or newer (tested on 3.12; nothing in the code needs newer than 3.9)
 - A Telegram bot token from BotFather
 - A Google AI Studio API key
-- A Groq API key
+- A Groq API key — optional, but strongly recommended: it is the chat fallback when Gemini's
+  free quota runs out, and it transcribes voice notes (Whisper). Without it, voice notes are
+  passed to the model as audio and rate limits show up as a "busy" reply.
 
 ---
 
@@ -130,7 +132,11 @@ All runtime settings come from environment variables. See `env.example.txt` for 
 
 `/feed <url>` `/papers <topic>` `/define <word>` `/holiday [cc]` — keyless lookups
 
-`/memory` (private chat only) `/forget` `/privacy` — your data
+`/memory` (private chat only) `/forget` `/privacy` `/clear` — your data and this chat's context
+
+`/myphoto` `/logo` — describe a profile picture (yours, or the bot's own logo)
+
+`/proactive on|off` — let the bot send at most one useful idea a day (off by default)
 
 `/rules` `/setup` `/welcome` `/stats` `/members` — group tools (admin-only where marked)
 
@@ -150,6 +156,9 @@ avenor-ai-telegram-bot/
 ├── requirements.txt    Python dependencies
 ├── env.example.txt     Environment variable template
 ├── privacy-policy.md   Privacy policy
+├── .gitignore          Ignore rules — the file MUST be named exactly ".gitignore".
+│                       Git does not read "gitignore.txt", which would leave .env and the
+│                       memory/roster JSON files un-ignored.
 ├── welcome.png         Optional group-welcome image (NOT included - the bot falls back
 │                       to a text card when it is absent)
 ├── LICENSE.txt         MIT

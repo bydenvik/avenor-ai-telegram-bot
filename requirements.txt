@@ -12,5 +12,8 @@ tzdata
 # real Telegram VOICE note (OGG/Opus). Without it, the bot still sends the audio
 # as a normal audio file. Remove this line if you want a lighter build.
 imageio-ffmpeg>=0.4.9
+# OPTIONAL: PyYAML. Without it, a generated .yaml/.yml file is not syntax-checked before it
+# is sent (validate_file() skips it silently). Everything else works without this line.
+# pyyaml>=6.0
 # aiolimiter is pulled in by the [rate-limiter] extra - no separate line needed
 python-dotenv>=1.0
