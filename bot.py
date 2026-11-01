@@ -979,6 +979,9 @@ SYSTEM_PROMPT = (
     "   ONLY when they asked for a file, document, code, script, website or page. NEVER for an "
     "analysis, a question, a summary, a review or a repository check - those are answered in "
     "the chat, not attached.\n"
+    "   NEVER write 'open it', 'download it' or 'attached' unless you actually emitted a "
+    "[file: ...] block for a request that asked for a file - the person cannot open something "
+    "that was never sent.\n"
     "   AFTER the [/file] line write at most TWO short lines: what the file is and how to use "
     "it. NEVER paste the file's content into the chat as well - the person already has the "
     "file, and a wall of code on a phone is unreadable. The bot checks the file's syntax "
@@ -986,6 +989,10 @@ SYSTEM_PROMPT = (
     "3. [voice] - send this reply as a voice note instead of text. Use it sparingly, only "
     "when hearing it beats reading it (a short warm line, a story, a pronunciation, casual "
     "voice chat). Never on ordinary informational answers.\n"
+    "   IF THEY ASK FOR VOICE (voice message, voice note, 'sunao', 'bol ke', 'awaaz me', "
+    "'voice me bolo'), you MUST emit [voice] and write your answer as something meant to be "
+    "HEARD: plain spoken sentences, no tables, no code, no headings, no bullet lists. A voice "
+    "request is answered by SPEAKING - never by building a website, a page or a file.\n"
     "   (If the person shares a YouTube link, the system has ALREADY read the video's "
     "title, channel, description and public captions for you - use them to answer.)\n"
     "4. [image: <description>] - create an image. Use it ONLY when they clearly want to SEE "
@@ -2427,6 +2434,28 @@ def _first_prose(text: str, limit: int = 300) -> str:
             b = cut.rstrip()
         return b
     return ""
+
+
+_ATTACH_CLAIM_RE = re.compile(
+    r"\b(?:ye\s*lo|yeh\s*lo|ye\s*le|open\s*kar\w*|browser\s*me(?:in)?|attached|"
+    r"attach\s*kar\w*|download\s*kar\w*|file\s*bhej\w*|file\s*hai|isko\s*open|ise\s*open|"
+    r"open\s*it|download\s*it|the\s+file|this\s+file|ye\s*file)\b", re.I)
+
+
+def _strip_attachment_claims(text: str) -> str:
+    """Remove sentences that promise an attachment when none was sent.
+
+    The model sometimes writes a [file:] block for a request that did not ask for a file. The
+    block is dropped (a file nobody asked for is worse), but the surrounding text still said
+    "open it in your browser" - so the person was told to open something that never arrived.
+    """
+    t = (text or "").strip()
+    if not t:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+|\n+", t)
+    keep = [p for p in parts if p.strip() and not _ATTACH_CLAIM_RE.search(p)]
+    out = " ".join(p.strip() for p in keep).strip()
+    return out
 
 
 def _visible_after_file(text: str, bodies: list, filename: str = "") -> str:
@@ -4975,6 +5004,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             filed_bodies: list = []
             file_note = ""
             filed_name = ""
+            dropped_files = 0
             for fm in list(_FILE_BLOCK_RE.finditer(ans or ""))[:2]:
                 fname, fbody = fm.group(1).strip(), fm.group(2)
                 ans = (ans or "").replace(fm.group(0), "").strip()
@@ -4985,6 +5015,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 # repository, the model used to invent an index.html and attach it.
                 if not _file_wanted(text):
                     log.info("dropped an unrequested [file: %s] for chat %s", fname, chat_id)
+                    dropped_files += 1
                     continue
                 if not action_allowed(chat_id, "file"):
                     continue
@@ -5008,6 +5039,16 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         file_sent = True
                         filed_name = fname
                         ans = (ans or "")[:mo.start()].strip()
+            if dropped_files and not file_sent:
+                # Nothing was attached, so nothing may say "open it".
+                cleaned = _strip_attachment_claims(ans)
+                if cleaned:
+                    ans = cleaned
+                else:
+                    ans = _msg(lang, en="Here is the answer.",
+                               hi="यह रहा जवाब.",
+                               hinglish="Ye raha jawab.")
+                log.info("removed attachment wording after dropping a file for chat %s", chat_id)
             if file_sent:
                 ans = _visible_after_file(ans, filed_bodies)
                 if not ans:
@@ -5161,7 +5202,25 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                                                  action=ChatAction.RECORD_VOICE)
                 except Exception:
                     pass
-                await send_voice_full(c.bot, chat_id, clean, lang)
+                # send_voice_full() returns how many notes it managed to send. It used to be
+                # ignored, so a TTS failure (quota, a rejected voice name, no audio) left the
+                # person who asked for a voice note with nothing but silence.
+                _spoken = await send_voice_full(c.bot, chat_id, clean, lang)
+                if not _spoken:
+                    log.warning("voice note requested but not produced for chat %s", chat_id)
+                    if _voice_only:
+                        # nothing was delivered at all - fall back to the text so the turn
+                        # is not empty
+                        for chunk in split_text(clean):
+                            await _safe_send(u, c, md_to_html(chunk), chunk)
+                    await _send_plain(c.bot, chat_id, _msg(
+                        lang,
+                        en="I could not make the voice note (the speech service did not "
+                           "answer). What I wanted to say is above.",
+                        hi="Voice note नहीं बन पाया (speech service ने जवाब नहीं दिया). जो कहना "
+                           "था वो ऊपर है.",
+                        hinglish="Voice note nahi ban paya (speech service ne jawab nahi diya). "
+                                 "Jo kehna tha wo upar hai."))
         finally:
             stop_evt.set()
             typing_task.cancel()
