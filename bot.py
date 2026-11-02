@@ -409,8 +409,8 @@ TTS_MAX_CHARS = int(os.environ.get("TTS_MAX_CHARS", "3000") or "3000")   # per-r
 TTS_CHUNK = int(os.environ.get("TTS_CHUNK", "900") or "900")             # chars per voice note
 TTS_MAX_NOTES = int(os.environ.get("TTS_MAX_NOTES", "8") or "8")         # max voice notes per reply
 TTS_MIN_TAIL = 140                                                        # merge tails shorter than this
-BUSY_MSG = ("🌸 Avenor is a little busy right now. "
-            "Please try again in a minute or two.")
+BUSY_MSG = ("🌸 Avenor is a little busy right now - every model provider is rate-limited. "
+            "Please send that again in a minute or two.")
 
 
 def _lang_for(u) -> str:
@@ -1252,6 +1252,7 @@ _LAST_GOOD = None          # the model that last answered - always tried first
 # Model ids that returned 404 (they do not exist for this key - e.g. the gemini-2.5-* ids
 # for a new project). Remembered so we never waste an attempt on them again.
 _DEAD_MODELS: set = set()
+_BAD500: dict = {}             # model -> consecutive 500 INTERNAL answers
 
 # ---- Image generation (Pollinations - free; key optional) ----
 IMAGE_ENABLED = os.environ.get("IMAGE_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -1290,7 +1291,11 @@ POLLINATIONS_TEXT_MODEL = os.environ.get("POLLINATIONS_TEXT_MODEL", "openai").st
 # silently whenever Gemini AND Groq both failed. Whether that is acceptable is the
 # operator's decision, not the code's: set POLLINATIONS_TEXT_ENABLED=true to allow it.
 # Image generation (a prompt the bot itself wrote) is separate and still on.
-POLLINATIONS_TEXT_ENABLED = (os.environ.get("POLLINATIONS_TEXT_ENABLED", "false")
+# ON by default again: with it off, a day when the Gemini free quota runs out turned every
+# reply into either "I am busy" or a wall of raw search results (both seen in the wild).
+# The switch is still there for anyone who does not want a third party to see the text -
+# the privacy policy names Pollinations as a sub-processor.
+POLLINATIONS_TEXT_ENABLED = (os.environ.get("POLLINATIONS_TEXT_ENABLED", "true")
                              .strip().lower() in ("1", "true", "yes", "on"))
 _LAST_IMAGE: dict = {}       # chat_id -> epoch of the last image (cooldown)
 HTTP_IMG = httpx.AsyncClient(timeout=150)
@@ -2583,6 +2588,14 @@ def _first_prose(text: str, limit: int = 300) -> str:
     return ""
 
 
+# A reply that SAYS it made/sent a file has to actually carry one. This is the wording
+# that appears in practice (English + Hinglish).
+_FILE_PROMISE_RE = re.compile(
+    r"(?i)\b(?:ye\s+lo|yeh\s+lo|ready\s+hai|ready\s+ho\s+gayi|ban\s+gayi|ban\s+gaya|"
+    r"attach(?:ed)?|download\s+kar|download\s+karke|bhej\s+diya|bhej\s+di|"
+    r"file\s+(?:neeche|niche)|neeche\s+file|niche\s+file|pdf\s+ready|"
+    r"here(?:\x27s| is)\s+the\s+file|see\s+the\s+attached|open\s+it\s+in)")
+
 _ATTACH_CLAIM_RE = re.compile(
     r"\b(?:ye\s*lo|yeh\s*lo|ye\s*le|open\s*kar\w*|browser\s*me(?:in)?|attached|"
     r"attach\s*kar\w*|download\s*kar\w*|file\s*bhej\w*|file\s*hai|isko\s*open|ise\s*open|"
@@ -2680,9 +2693,10 @@ _AUTO_IMAGE_RE = re.compile(r"\[\s*image\s*:\s*([^\]]{3,300})\]", re.I)
 # The model normally emits [file:] / [image:] by itself. When it does not, these catch a
 # PLAIN-WORD request (no command) so the person still gets the artefact they asked for.
 _FILE_EXT_RE = re.compile(
-    r"([A-Za-z0-9][A-Za-z0-9._\-]{0,40}\.(?:md|txt|csv|json|py|html|xml|yaml|yml|sql|js|css))\b",
+    r"([A-Za-z0-9][A-Za-z0-9._\-]{0,40}\.(?:md|txt|csv|json|py|html|xml|yaml|yml|sql|js|css|pdf|rtf|docx?|xlsx?|pptx?|odt|ods))\b",
     re.I)
 _FILE_NOUN = (r"(?:file|document|report|notes?|story|script|code|program|snippet|csv|json|"
+              r"pdf|docx?|xlsx?|pptx?|rtf|odt|"
               r"checklist|draft|plan|resume|letter|essay|table|spreadsheet|"
               r"website|webpage|site|page|html|landing|dashboard|template|app|application|"
               r"फाइल|फ़ाइल|दस्तावेज़|रिपोर्ट|नोट्स|लिखो|तालिका|वेबसाइट)")
@@ -2690,7 +2704,7 @@ _FILE_VERB = (r"(?:bana|banao|banaye|banaao|banado|bana\s*do|create|make|write|g
               r"download|attach|export|dedo|de\s*do|likho|likh\s*do|chahiye|chaiye|"
               r"बनाओ|बनाइए|लिखो|लिखिए|सेव|भेजो|चाहिए)")
 _FILE_WANT_RE = re.compile(
-    r"\.(?:md|txt|csv|json|py|html|xml|yaml|yml|sql|js|css)\b"
+    r"\.(?:md|txt|csv|json|py|html|xml|yaml|yml|sql|js|css|pdf|rtf|docx?|xlsx?|pptx?)\b"
     r"|" + _FILE_NOUN + r"[^.\n]{0,40}?" + _FILE_VERB +
     r"|" + _FILE_VERB + r"[^.\n]{0,30}?" + _FILE_NOUN,
     re.I)
@@ -2771,7 +2785,8 @@ def _guess_filename(text: str, body: str) -> str:
     if m:
         return safe_filename(m.group(1))
     low = (text or "").lower()
-    for kw, name in (("csv", "data.csv"), ("json", "data.json"), ("python", "script.py"),
+    for kw, name in (("pdf", "document.pdf"), ("csv", "data.csv"),
+                     ("json", "data.json"), ("python", "script.py"),
                      ("script", "script.py"), ("html", "page.html"), ("report", "report.md"),
                      ("story", "story.md"), ("plan", "plan.md"), ("checklist", "checklist.md"),
                      ("notes", "notes.md"), ("resume", "resume.md"), ("letter", "letter.md"),
@@ -3130,7 +3145,7 @@ _ACTION_LAST: dict = {}       # (chat_id, kind) -> epoch of the last allowed act
 _ACTION_DAY: dict = {}        # (chat_id, kind) -> (day_key, count)
 
 ALLOWED_FILE_EXT = {"md", "txt", "csv", "json", "py", "html", "xml", "yaml", "yml",
-                    "log", "ini", "cfg", "sql", "sh", "js", "css", "tsv"}
+                    "log", "ini", "cfg", "sql", "sh", "js", "css", "tsv", "pdf"}
 MAX_FILE_BYTES = int(os.environ.get("MAX_FILE_BYTES", str(2 * 1024 * 1024)) or str(2 * 1024 * 1024))
 
 
@@ -3177,6 +3192,82 @@ def safe_filename(name: str, fallback: str = "avenor_file.txt") -> str:
     return n
 
 
+def _text_to_pdf(text: str, title: str = "Avenor") -> bytes:
+    """A small but VALID PDF 1.4 built from plain text - no dependency, no browser.
+
+    A4, Helvetica 11, wrapped lines, as many pages as needed. Characters outside
+    Latin-1 (emoji, Devanagari) become "?" because the 14 standard PDF fonts have no
+    glyphs for them - a real font would have to be embedded for those.
+    """
+    def esc(t: str) -> str:
+        return t.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+
+    def enc(t: str) -> str:
+        return (t or "").encode("latin-1", "replace").decode("latin-1")
+
+    raw_lines = []
+    for raw in enc(text or "").splitlines():
+        raw = raw.replace("\t", "    ").rstrip()
+        if not raw:
+            raw_lines.append("")
+            continue
+        while len(raw) > 92:
+            cut = raw.rfind(" ", 0, 92)
+            if cut < 40:
+                cut = 92
+            raw_lines.append(raw[:cut])
+            raw = raw[cut:].lstrip()
+        raw_lines.append(raw)
+    if not raw_lines:
+        raw_lines = [""]
+    per_page = 46
+    pages = [raw_lines[i:i + per_page] for i in range(0, len(raw_lines), per_page)]
+
+    def stream_for(lines) -> str:
+        out = ["BT", "/F1 11 Tf", "15 TL", "56 786 Td"]
+        for ln in lines:
+            out.append("(" + esc(ln) + ") Tj T*")
+        out.append("ET")
+        return "\n".join(out)
+
+    objs = {}                                  # number -> body (without "n 0 obj")
+    n_pages = len(pages)
+    page_ids = [4 + 2 * i for i in range(n_pages)]
+    objs[1] = "<< /Type /Catalog /Pages 2 0 R >>"
+    kids = " ".join(f"{p} 0 R" for p in page_ids)
+    objs[2] = f"<< /Type /Pages /Kids [{kids}] /Count {n_pages} >>"
+    objs[3] = ("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica "
+               "/Encoding /WinAnsiEncoding >>")
+    for i, lines in enumerate(pages):
+        pid = page_ids[i]
+        cid = pid + 1
+        objs[pid] = (f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] "
+                     f"/Resources << /Font << /F1 3 0 R >> >> /Contents {cid} 0 R >>")
+        body = stream_for(lines)
+        objs[cid] = f"<< /Length {len(body)} >>\nstream\n{body}\nendstream"
+    info_id = max(objs) + 1
+    objs[info_id] = (f"<< /Title ({esc(enc(title))}) /Producer (Avenor) "
+                     f"/Creator (Avenor Telegram bot) >>")
+
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = {}
+    for num in sorted(objs):
+        offsets[num] = len(out)
+        out += f"{num} 0 obj\n{objs[num]}\nendobj\n".encode("latin-1", "replace")
+    xref_at = len(out)
+    top = max(objs) + 1
+    out += f"xref\n0 {top}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for num in range(1, top):
+        if num in offsets:
+            out += f"{offsets[num]:010d} 00000 n \n".encode()
+        else:
+            out += b"0000000000 65535 f \n"
+    out += (f"trailer\n<< /Size {top} /Root 1 0 R /Info {info_id} 0 R >>\n"
+            f"startxref\n{xref_at}\n%%EOF\n").encode()
+    return bytes(out)
+
+
 async def send_made_file(bot, chat_id: int, name: str, content: str) -> bool:
     """Send AI-written text as a real file attachment."""
     try:
@@ -3190,7 +3281,11 @@ async def send_made_file(bot, chat_id: int, name: str, content: str) -> bool:
                 body = body[:cut + 1] + "\n" + tag + body[cut + 1:].lstrip()
             else:
                 body = tag + body
-        data = body.strip().encode("utf-8")[:MAX_FILE_BYTES]
+        if safe_filename(name).lower().endswith(".pdf"):
+            # A PDF has to BE a PDF, not text with a .pdf name.
+            data = _text_to_pdf(body, safe_filename(name))
+        else:
+            data = body.strip().encode("utf-8")[:MAX_FILE_BYTES]
         if not data:
             return False
         await rate_gate(chat_id)
@@ -4293,6 +4388,14 @@ async def _gemini_pass(contents, sys_instr, budget: float = 0.0, effort: str = "
                 if "404" in last or "not found" in last.lower():
                     _DEAD_MODELS.add(model)
                     log.warning("%s does not exist for this key - skipping it from now on", model)
+                elif "500" in last or "INTERNAL" in last:
+                    # A model that 500s is broken on Google's side, not rate-limited. Two
+                    # strikes and it is parked, so it stops costing an attempt on every
+                    # reply (/diag showed gemma-4-31b-it failing every time).
+                    _BAD500[model] = _BAD500.get(model, 0) + 1
+                    if _BAD500[model] >= 2:
+                        _DEAD_MODELS.add(model)
+                        log.warning("%s failed with 500 twice - parking it", model)
                 if quota:
                     # Gemini quota is shared per PROJECT, so once two models say 429 the
                     # rest will too - stop hammering and let Groq/Pollinations answer.
@@ -5484,7 +5587,7 @@ def _short_summary(media, state, text, forward):
     return " ".join(bits).strip()
 
 
-async def _live_fallback(text: str, chat_id: int, pre: str = "") -> str:
+async def _live_fallback(text: str, chat_id: int, pre: str = "", lang: str = "hinglish") -> str:
     """Answer from the LIVE SOURCES themselves when no model is available.
 
     A factual question must never be answered with "I am busy" - the search layer is
@@ -5492,6 +5595,11 @@ async def _live_fallback(text: str, chat_id: int, pre: str = "") -> str:
     If pre-flight research already fetched data this turn, REUSE it: calling the search
     again would be blocked by its own cooldown and would waste a lookup.
     """
+    # "created a sun set image" is not a factual question. Dumping web results at it was
+    # nonsense - the person wanted a picture. Only look up sources when the message is
+    # actually asking about the world.
+    if not (_needs_live(text or "") or _QUESTION_RE.search(text or "")):
+        return ""
     live = pre or ""
     if not live:
         if not (RESEARCH_ENABLED and text and action_allowed(chat_id, "search")):
@@ -5504,8 +5612,24 @@ async def _live_fallback(text: str, chat_id: int, pre: str = "") -> str:
     if not live:
         return ""
     log.info("model unavailable - answering chat %s from live sources", chat_id)
-    return ("Live sources se abhi ye mila:\n\n" + live[:2500] +
-            "\n\n_(AI ka jawab abhi nahi ban paya, ye seedha live sources se hai.)_")
+    # A wall of raw search output is not an answer. This used to paste up to 2,500
+    # characters of "=== WEB RESULTS === ..." into the chat, for ANY message - including
+    # "created a sun set image". Now: at most three one-line sources, ~400 characters.
+    picks = []
+    for ln in (live or "").splitlines():
+        ln = ln.strip()
+        if not ln.startswith("- ") or "===" in ln:
+            continue
+        picks.append(ln[2:].strip()[:150])
+        if len(picks) >= 3:
+            break
+    if not picks:
+        return ""
+    head = _msg(lang,
+                en="The AI is not answering right now. This is what the live sources say:",
+                hi="AI abhi jawab nahi de raha. Live sources se ye mila:",
+                hinglish="AI abhi jawab nahi de raha. Live sources se ye mila:")
+    return head + "\n\n" + "\n".join("• " + p for p in picks)
 
 
 async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None,
@@ -6047,7 +6171,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 # Every model (Gemini -> Groq -> Pollinations) is unavailable. A factual
                 # question should still be answered, so use the live sources directly
                 # instead of shipping "I am busy" to someone who asked a real question.
-                clean = (await _live_fallback(text, chat_id, pre_research) or
+                clean = (await _live_fallback(text, chat_id, pre_research, lang) or
                          _msg(lang,
                               en="I could not put an answer together just now - the model "
                                  "is busy and the live sources came back empty. Please send "
@@ -6081,7 +6205,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 if not clean:
                     # The model returned nothing twice - answer from the live sources rather
                     # than a useless "technical error".
-                    clean = (await _live_fallback(text, chat_id, pre_research) or
+                    clean = (await _live_fallback(text, chat_id, pre_research, lang) or
                              _msg(lang,
                                   en="I could not answer that one - the model is busy. "
                                      "Please send it again in a little while.",
@@ -6092,8 +6216,13 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # ---- NATURAL-LANGUAGE FILE FALLBACK ---------------------------------
             # The model did not emit [file:], but the person clearly asked for a file in plain
             # words (no command). If the answer is substantial, attach it as a real download.
+            # A reply that PROMISES a file ("ye lo PDF ready hai, download karke dekh lo")
+            # must carry one even when it is short - the screenshot case had the promise and
+            # no file at all. FILE_PROMISE_MIN is the floor for that case only.
+            _promised = bool(_FILE_PROMISE_RE.search(clean or ""))
+            _need = 60 if _promised else FILE_FALLBACK_MIN
             if (not file_sent and text and _file_requested(text)
-                    and len(clean) >= FILE_FALLBACK_MIN and action_allowed(chat_id, "file")):
+                    and len(clean) >= _need and action_allowed(chat_id, "file")):
                 _fname = _guess_filename(text, clean)
                 if await send_made_file(c.bot, chat_id, _fname, clean):
                     file_sent = True
@@ -6105,6 +6234,18 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     # then the whole answer was also sent as a message underneath.
                     clean = _caption_for_attachment(clean, _fname)
                     log.info("auto-attached a file for chat %s (plain-word request)", chat_id)
+            if not file_sent and _promised:
+                # We could not build it. Do not leave the promise standing - say the truth.
+                clean = _strip_attachment_claims(clean)
+                if not clean.strip():
+                    clean = _msg(lang,
+                                 en="I could not build that file just now - ask me again "
+                                    "and I will attach it.",
+                                 hi="अभी वो file नहीं बना पाया - दोबारा कहिए, attach कर "
+                                    "दूँगा.",
+                                 hinglish="Abhi wo file nahi bana paya - dobara kaho, "
+                                           "attach kar dunga.")
+                log.info("stripped a file promise for chat %s (nothing was attached)", chat_id)
 
             log_line(chat_id, "Avenor", clean, 0)      # the bot is not a user
 
@@ -9263,6 +9404,12 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              + (f", daily cap {USER_DAILY_CAP}" if USER_DAILY_CAP else ", no daily cap"),
              f"💾 Memory file: {getattr(MEM, 'MEMORY_FILE', 'n/a')}",
              "--- live self-test (Gemini is primary, Groq secondary) ---"]
+    _parked = sorted(m for m in GEMINI_MODELS if m in _DEAD_MODELS)
+    if _parked:
+        _alive = [m for m in GEMINI_MODELS if m not in _DEAD_MODELS]
+        lines += ["", "🗑 parked (404 or repeated 500): " + ", ".join(_parked),
+                  "   paste this so the bot stops trying them:",
+                  "   GEMINI_MODELS=" + ",".join(_alive)]
     if client is None:
         lines.append("❌ Gemini client not created (GEMINI_API_KEY missing).")
     else:

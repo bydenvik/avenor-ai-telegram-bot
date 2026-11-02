@@ -29,6 +29,11 @@ The bot is meant to run as a long-lived service. It should work on any platform 
   deepest pass** (higher thinking level, a 45s budget and a 6144-token answer). No switch to
   flip — and if a model rejects the top thinking level it steps down one level instead of
   switching thinking off.
+- **Writes real files, including a real PDF.** Markdown, text, CSV, JSON, Python, HTML,
+  CSS, SQL, YAML - and `.pdf`: the bot builds a valid PDF 1.4 itself (no browser, no
+  library) so "ek pdf banao" produces a document you can actually open. A reply that
+  says it attached a file always carries one; if it cannot build it, it says so instead.
+
 - **Writes the request down before it builds.** A build request first produces a short
   numbered spec of what was actually asked for, and that spec - not the whole chat - is the
   brief the model builds against. The finished file is then checked against the same spec,
