@@ -348,6 +348,14 @@ _LEVEL_DOWNGRADE = {"high": "low", "low": "minimal", "minimal": ""}
 _LEVEL_IN_USE: dict = {}                  # requested level -> level the models accept
 
 
+# A request may CHECK an action budget several times while it works out how to answer a
+# single message (spec gate -> [file:] block -> fallback -> guard). A check must not spend
+# the budget, or the second check always fails and the action never happens. So a grant is
+# remembered per TURN: _TURN_ID is bumped once per incoming message, and the same kind
+# stays granted for that message only. A genuinely new request gets the cooldown as before.
+_TURN_ID = 0
+_ACTION_TURN: dict = {}       # (chat_id, kind) -> the turn id that was granted
+
 TURN_MAX_CALLS = max(1, int(os.environ.get("TURN_MAX_CALLS", "8") or "8"))
 TURN_BUDGET = float(os.environ.get("TURN_BUDGET", "90") or "90")   # seconds, wall clock
 _TURN: dict = {}       # chat_id -> [calls_used, deadline_monotonic]
@@ -355,6 +363,8 @@ _TURN: dict = {}       # chat_id -> [calls_used, deadline_monotonic]
 
 def _turn_begin(chat_id) -> None:
     """Open a fresh budget for one incoming message."""
+    global _TURN_ID
+    _TURN_ID += 1                     # this message is a NEW request
     _TURN[chat_id] = [0, time.monotonic() + TURN_BUDGET]
 
 
@@ -2725,6 +2735,16 @@ def _looks_like_full_file(text: str) -> bool:
             and ("<style" in low or "function " in low or "def " in low or "</" in low))
 
 
+def _file_error_msg(lang: str) -> str:
+    return _msg(lang,
+                en="I built it, but sending the file failed on my side. Ask again and I "
+                   "will retry - I will not paste the whole document into the chat.",
+                hi="फ़ाइल बन गई, पर भेजते waqt मेरी तरफ़ से error आ गया. फिर कहिए, दोबारा "
+                   "भेजूँगा - पूरा document chat में paste नहीं करूँगा.",
+                hinglish="File ban gayi, par bhejte waqt error aa gaya. Phir kaho, dobara "
+                         "bhejunga - poora document chat me paste nahi karunga.")
+
+
 def _file_blocked_msg(lang: str) -> str:
     return _msg(lang,
                 en="I built it, but I cannot send another file to this chat this second. "
@@ -3121,6 +3141,11 @@ def action_allowed(chat_id: int, kind: str) -> bool:
     still gives each chat its own allowance instead of one shared bucket.
     """
     cool, cap = ACTION_LIMITS.get(kind, (ACTION_COOLDOWN, ACTION_DAILY_CAP))
+    key = (chat_id, kind)
+    # Already granted for THIS message? Then yes, and do not charge twice - the same turn
+    # legitimately asks several times while it decides how to deliver the answer.
+    if _ACTION_TURN.get(key) == _TURN_ID:
+        return True
     now = time.time()
     if now - _ACTION_LAST.get((chat_id, kind), 0.0) < cool:
         return False
@@ -3132,6 +3157,7 @@ def action_allowed(chat_id: int, kind: str) -> bool:
         return False
     _ACTION_DAY[(chat_id, kind)] = (d, n + 1)
     _ACTION_LAST[(chat_id, kind)] = now
+    _ACTION_TURN[key] = _TURN_ID
     return True
 
 
@@ -4117,7 +4143,8 @@ async def send_generated_image(bot, chat_id: int, prompt: str,
     now = time.time()
     if now - _LAST_IMAGE.get(chat_id, 0) < IMAGE_COOLDOWN:
         return False
-    _LAST_IMAGE[chat_id] = now
+    # Stamped only after a successful send: it used to be stamped here, so one failed
+    # generation blocked every retry for IMAGE_COOLDOWN seconds for no reason.
     try:
         await bot.send_chat_action(chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO)
     except Exception:  # noqa: BLE001
@@ -4129,6 +4156,7 @@ async def send_generated_image(bot, chat_id: int, prompt: str,
     try:
         await bot.send_photo(chat_id=chat_id, photo=io.BytesIO(data),
                              caption=f"🎨 {prompt.strip()[:900]}")
+        _LAST_IMAGE[chat_id] = now
         return True
     except Exception as e:  # noqa: BLE001
         log.warning("send_photo failed: %s", e)
@@ -5864,6 +5892,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # The screenshot case: the model wrote the page inline, or the file action was
             # rate-limited, so the reply was the raw HTML. Turn it into a file if we still
             # can, and say so plainly if we cannot.
+            _send_failed = False
             if not file_sent and _looks_like_full_file(ans or ""):
                 _dfname = _guess_filename(text or "", ans or "")
                 log.info("reply looks like a whole document (%s chars) - attaching as %s",
@@ -5882,9 +5911,10 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         if _dnote or _dthin or _dpolish:
                             ans = (ans + "\n\n" + (_dnote or _dthin or _dpolish)).strip()
                     else:
-                        file_blocked = True
+                        _send_failed = True          # we were allowed, the send itself failed
                 if not file_sent:
-                    ans = _file_blocked_msg(lang)
+                    ans = (_file_error_msg(lang) if _send_failed
+                           else _file_blocked_msg(lang))
             # The model DID write a [file:] block but we could not deliver it. Say so - never
             # leave the person with a reply that mentions a file they never received.
             if file_blocked and not file_sent and (ans or "").strip():
@@ -6266,6 +6296,7 @@ async def _cleanup_once() -> None:
     for k in list(_ACTION_LAST):
         if _ACTION_LAST[k] < cutoff:
             _ACTION_LAST.pop(k, None)
+            _ACTION_TURN.pop(k, None)
     for k in list(_ACTION_DAY):
         if _ACTION_DAY[k][0] != _today:
             _ACTION_DAY.pop(k, None)
@@ -7570,6 +7601,7 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
     canon = "https://www.youtube.com/watch?v=" + vid
     title = author = desc = transcript = ""
     views = published = thumb = ""
+    comment_total = ""
     comments: list = []
     # 1. YouTube's own public oEmbed endpoint (documented, no key).
     try:
@@ -7605,12 +7637,34 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
             mt = re.search(r'"thumbnailUrl":\["([^"]+)"', page or "")
             if mt:
                 thumb = mt.group(1)
+        # The player endpoint answers LOGIN_REQUIRED ("sign in to confirm you are not a "
+        # bot") for a growing share of videos, and then videoDetails is EMPTY - which is
+        # why the bot told the user it had no access to the view count. The watch page
+        # still carries it, so fall back to that.
+        if not views:
+            mv = re.search(r'"viewCount":"(\d+)"', page or "")
+            if mv:
+                try:
+                    views = f"{int(mv.group(1)):,}"
+                except ValueError:
+                    views = mv.group(1)
+            else:
+                ms = re.search(r'"shortViewCount":\{"simpleText":"([^"]+)"', page or "")
+                if ms:
+                    views = ms.group(1)
+        if not author:
+            ma = re.search(r'"ownerChannelName":"([^"]+)"', page or "")
+            if ma:
+                author = _yt_unescape(ma.group(1))
         mp = re.search(r'"publishDate":"([^"]+)"', page or "") or \
             re.search(r'"uploadDate":"([^"]+)"', page or "")
         if mp:
             published = mp.group(1)[:10]
         # the top comments, from the page's own comment continuation
         comments = await _yt_comments(page)
+        mc = re.search(r'"commentCount":\{"simpleText":"([^"]+)"', page or "")
+        if mc:
+            comment_total = _yt_unescape(mc.group(1))
     except Exception as e:  # noqa: BLE001
         log.debug("yt page failed: %s", str(e)[:80])
     if page:
@@ -7659,8 +7713,16 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
         out.append("description: " + re.sub(r"\s+", " ", desc)[:1200])
     if transcript:
         out.append("transcript (public captions, may be partial): " + transcript)
-    if comments:
-        out.append("top comments (public):\n" + "\n".join(comments))
+    if comments or comment_total:
+        if comment_total:
+            head = f"comments: {comment_total}"
+            if comments:
+                head += f" (showing the top {len(comments)})"
+        else:
+            head = f"comments: {len(comments)} shown (public, newest first)"
+        out.append(head + ("\n" + "\n".join(comments) if comments else ""))
+        out.append("Give the person these numbers as facts. Do not say you cannot see "
+                   "views or comments - they are printed above.")
     return "\n".join(out)
 
 
