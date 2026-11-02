@@ -3351,32 +3351,66 @@ def validate_file(name: str, content: str) -> str:
     return ""                              # md / txt / others: nothing to validate
 
 
+def _problem_context(content: str, problem: str, span: int = 4) -> str:
+    """The lines around the reported fault, numbered, so the model can SEE it."""
+    m = re.search(r"line\s+(\d+)", problem or "")
+    if not m:
+        return ""
+    try:
+        n = int(m.group(1))
+    except ValueError:
+        return ""
+    lines_ = (content or "").splitlines()
+    if not lines_:
+        return ""
+    lo = max(1, n - span)
+    hi = min(len(lines_), n + span)
+    return "\n".join(f"{i:>5}| {lines_[i - 1][:200]}" for i in range(lo, hi + 1))[:1200]
+
+
 async def _validate_and_repair(chat_id, name: str, content: str) -> tuple:
-    """(content, note). Ask the model once to repair a broken file."""
+    """(content, note). Repair a broken file - twice, with the fault shown to the model.
+
+    It used to be one blind attempt that only said "<a> opened on line 96 is never closed";
+    when that failed, the broken file was shipped to the person with a warning. Handing over
+    the actual lines around the fault makes the fix trivial, and a second attempt costs
+    nothing when the first one missed.
+    """
     problem = validate_file(name, content)
     if not problem:
         return content, ""
     log.info("generated file %s failed validation: %s", name, problem)
-    try:
-        fix = await ask_gemini(
-            chat_id,
-            f"The file {name} you just wrote is broken: {problem}.\\n"
-            f"Return the COMPLETE corrected file only, inside a single "
-            f"[file: {name}] ... [/file] block, with no commentary.",
-            _guard("=== BROKEN FILE TO REPAIR ===\\n"
-                   "Fix exactly the reported problem and return the whole file again. "
-                   "Do not shorten it, do not add explanation."))
-        m = _FILE_BLOCK_RE.search(fix or "") or None
-        if m:
+    best = content
+    for attempt in range(2):
+        snippet = _problem_context(best, problem)
+        try:
+            fix = await ask_gemini(
+                chat_id,
+                f"The file {name} you just wrote is broken: {problem}.\n"
+                + (f"\nLines around it (line number | text):\n{snippet}\n" if snippet else "")
+                + f"\nReturn the COMPLETE corrected file only, inside a single "
+                  f"[file: {name}] ... [/file] block, with no commentary.",
+                _guard("=== BROKEN FILE TO REPAIR ===\n"
+                       "Fix exactly the reported problem and return the whole file again.\n"
+                       "- An unclosed tag needs its closing tag in the right place: do not "
+                       "delete the element and do not reformat the rest of the file.\n"
+                       "- Do not shorten it, do not add explanation."))
+            m = _FILE_BLOCK_RE.search(fix or "")
+            if not m:
+                continue
             fixed = m.group(2)
             problem2 = validate_file(name, fixed)
             if not problem2:
-                log.info("generated file %s repaired", name)
+                log.info("generated file %s repaired on attempt %s", name, attempt + 1)
                 return fixed, ""
-            problem = problem2
-    except Exception as e:  # noqa: BLE001
-        log.warning("file repair failed: %s", str(e)[:120])
-    return content, f"⚠️ Heads-up: this file may not run as-is ({problem})."
+            if len(fixed) >= 200:
+                best, problem = fixed, problem2
+                log.info("repair attempt %s still faulty: %s", attempt + 1, problem[:80])
+        except Exception as e:  # noqa: BLE001
+            log.warning("file repair attempt %s failed: %s", attempt + 1, str(e)[:120])
+    return best, f"\u26a0\ufe0f Heads-up: this file may not run as-is ({problem})."
+
+
 
 
 # A "make me a website" request that comes back as a 1 KB stub is not a small file, it is
@@ -5627,6 +5661,15 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                             "read - inventing its contents is worse than saying you could not "
                             "open it.")
                     log.info("link could not be read for chat %s", chat_id)
+                # Numbers the reader MEASURED (views, comments, price, date) are facts.
+                # The model has denied them while looking straight at them.
+                ctx += ("\n\n=== RULE FOR THE LINK DATA ABOVE ===\n"
+                        "Lines like `views: 126`, `comments: 3`, `title: ...`, "
+                        "`price: ...`, `published: ...` are MEASURED VALUES, not text to "
+                        "summarise. Quote them exactly. If the person asked for a count or "
+                        "a number and it is printed above, you MUST give it - saying it is "
+                        "not available in the link data while it is right there is a wrong "
+                        "answer.")
 
             # ---- THE SPEC (what they actually asked for) ------------------------
             # Written down BEFORE the build, so the file is made to this list and nothing
@@ -7698,31 +7741,34 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
     # the model gets the thumbnail as an IMAGE as well as the URL
     if await _stash_link_image(chat_id, thumb, "YouTube thumbnail"):
         pass
-    out = ["YouTube video: " + (title or vid)]
+    # FACTS FIRST. These are measured, not guessed, and they go at the very top of the
+    # block - the reply in the screenshot listed title/channel/thumbnail (all from this
+    # block) and then claimed the view count was "not available" four lines further down.
+    out = ["=== YOUTUBE FACTS (exact, fetched just now) ==="]
+    out.append("title: " + (title or vid))
     if author:
         out.append("channel: " + author)
-    if views:
-        out.append("views: " + views)
+    out.append("views: " + (views or "unknown (the page published no count)"))
     if published:
         out.append("published: " + published)
+    if comment_total:
+        out.append("total comments: " + comment_total)
+    elif comments:
+        out.append(f"comments read: {len(comments)} (the page published no total)")
+    else:
+        out.append("comments: none readable (turned off or still loading)")
     if thumb:
-        out.append("thumbnail URL: " + thumb +
-                   " (the image itself is attached to you - look at it and describe what "
-                   "is actually on screen)")
+        out.append("thumbnail: " + thumb + " - the image itself is attached to you; "
+                   "look at it and describe what is actually on screen")
+    out.append("=== VIDEO ===")
     if desc:
         out.append("description: " + re.sub(r"\s+", " ", desc)[:1200])
     if transcript:
         out.append("transcript (public captions, may be partial): " + transcript)
-    if comments or comment_total:
-        if comment_total:
-            head = f"comments: {comment_total}"
-            if comments:
-                head += f" (showing the top {len(comments)})"
-        else:
-            head = f"comments: {len(comments)} shown (public, newest first)"
-        out.append(head + ("\n" + "\n".join(comments) if comments else ""))
-        out.append("Give the person these numbers as facts. Do not say you cannot see "
-                   "views or comments - they are printed above.")
+    if comments:
+        out.append("top comments (public):\n" + "\n".join(comments))
+    out.append("USE THE NUMBERS ABOVE: views and comments are printed at the top of this "
+               "block. State them as facts and never say a count is unavailable.")
     return "\n".join(out)
 
 
