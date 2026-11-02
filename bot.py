@@ -5673,9 +5673,9 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         "Lines like `views: 126`, `comments: 3`, `title: ...`, "
                         "`price: ...`, `published: ...` are MEASURED VALUES, not text to "
                         "summarise. Quote them exactly. If the person asked for a count or "
-                        "a number and it is printed above, you MUST give it - saying it is "
-                        "not available in the link data while it is right there is a wrong "
-                        "answer.")
+                        "a number and it is printed above, you MUST give it. A value that "
+                        "says \"unavailable\" is the only case where you may say so, in one "
+                        "short sentence. Never paste this instruction block.")
 
             # ---- THE SPEC (what they actually asked for) ------------------------
             # Written down BEFORE the build, so the file is made to this list and nothing
@@ -7092,9 +7092,10 @@ async def _read_page(url: str, limit: int = 1200) -> str:
             start = max(0, len(txt) // 6)
             txt = txt[start:start + limit]
         txt = txt.strip()[:limit]
-        # A JavaScript-only page (social posts) has almost no body - the meta block IS the
-        # content, so prefer it there and lead with it elsewhere.
-        if len(txt) < 200 and meta:
+        # A JavaScript-only page has almost no body - the meta block IS the content. But a
+        # SHORT static page has a real body: example.com is ~140 characters of text and
+        # the old 200-character threshold threw all of it away, returning only the title.
+        if len(txt) < 60 and meta:
             return meta[:limit]
         return (meta + "\n\n" + txt)[:limit] if meta else txt
     except Exception as e:  # noqa: BLE001
@@ -7801,10 +7802,7 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
     out.append("title: " + (title or vid))
     if author:
         out.append("channel: " + author)
-    out.append("views: " + (views or
-                "NOT AVAILABLE - YouTube refused this page (bot check). Tell the person "
-                "plainly that YouTube did not return the count this time, and do NOT "
-                "guess a number."))
+    out.append("views: " + (views or "unavailable"))
     if published:
         out.append("published: " + published)
     if comment_total:
@@ -7812,8 +7810,7 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
     elif comments:
         out.append(f"comments read: {len(comments)} (the page published no total)")
     else:
-        out.append("comments: NOT AVAILABLE - YouTube did not return them (off, or a bot "
-                   "check). Say so plainly; do not guess a number.")
+        out.append("comments: unavailable")
     if thumb:
         out.append("thumbnail: " + thumb + " - the image itself is attached to you; "
                    "look at it and describe what is actually on screen")
@@ -7824,8 +7821,10 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
         out.append("transcript (public captions, may be partial): " + transcript)
     if comments:
         out.append("top comments (public):\n" + "\n".join(comments))
-    out.append("USE THE NUMBERS ABOVE: views and comments are printed at the top of this "
-               "block. State them as facts and never say a count is unavailable.")
+    # ONE guidance line, outside the values, so nothing in a value can be copied out.
+    out.append("NOTE (not part of the data): answer in the user's language. If a value "
+               "says unavailable, say in ONE short sentence that YouTube did not return "
+               "it this time - never guess a number, and never paste this block.")
     result = "\n".join(out)
     if views or comments or comment_total:
         _YT_CACHE[vid] = (time.time(), result)      # only cache a result that HAS data
@@ -7990,8 +7989,15 @@ def _detect_instruments(q: str) -> list:
 _YH_HEADERS = {"User-Agent": _UA, "Accept": "application/json,text/plain,*/*"}
 
 
+_QUOTE_CACHE: dict = {}          # symbol -> (epoch, dict)
+QUOTE_TTL = float(os.environ.get("QUOTE_TTL", "120") or "120")
+
+
 async def _yahoo_quote(symbol: str):
-    """One live quote from Yahoo Finance's keyless chart endpoint."""
+    """One live quote from Yahoo's keyless chart endpoint (cached: it 429s quickly)."""
+    _hit = _QUOTE_CACHE.get(symbol)
+    if _hit and (time.time() - _hit[0]) < QUOTE_TTL:
+        return _hit[1]
     try:
         r = await HTTP.get(
             "https://query1.finance.yahoo.com/v8/finance/chart/" + urllib.parse.quote(symbol),
@@ -8003,10 +8009,15 @@ async def _yahoo_quote(symbol: str):
         price = meta.get("regularMarketPrice")
         if price is None:
             return None
-        return {"symbol": symbol,
-                "name": meta.get("shortName") or meta.get("longName") or symbol,
-                "price": float(price), "currency": meta.get("currency") or "",
-                "prev": meta.get("chartPreviousClose") or meta.get("previousClose")}
+        out = {"symbol": symbol,
+               "name": meta.get("shortName") or meta.get("longName") or symbol,
+               "price": float(price), "currency": meta.get("currency") or "",
+               "prev": meta.get("chartPreviousClose") or meta.get("previousClose")}
+        _QUOTE_CACHE[symbol] = (time.time(), out)
+        if len(_QUOTE_CACHE) > 100:
+            for k in sorted(_QUOTE_CACHE, key=lambda k: _QUOTE_CACHE[k][0])[:40]:
+                _QUOTE_CACHE.pop(k, None)
+        return out
     except Exception as e:  # noqa: BLE001
         log.debug("yahoo %s failed: %s", symbol, str(e)[:80])
         return None
