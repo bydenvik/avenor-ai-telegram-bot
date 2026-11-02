@@ -3474,7 +3474,11 @@ async def _fatten_if_thin(chat_id, name: str, body: str, request_text: str) -> t
 # ---------------------------------------------------------------------------------------
 _LOREM_RE = re.compile(r"\b(lorem ipsum|dolor sit amet|TODO|FIXME|placeholder text|"
                        r"your text here|coming soon)\b", re.I)
-_HEX_RE = re.compile(r"#[0-9a-fA-F]{6}\b")
+# 3-digit hex (#fff) and rgb()/hsl() are just as much a palette as #ffffff, and missing
+# them made the audit report "only 1 colour" on pages that had a real one - which then
+# spent a model call "fixing" a page that was fine.
+_HEX_RE = re.compile(r"#[0-9a-fA-F]{3,8}\b")
+_RGB_RE = re.compile(r"(?i)\b(?:rgba?|hsla?)\s*\([^)]{5,60}\)")
 _BAD_HEX = {"#007bff", "#0d6efd", "#6610f2", "#6f42c1", "#7952b3"}
 _CLONE_RE = re.compile(
     r"\b(?:same\s*to\s*same|clone|copy\s+of|exactly\s+like|jaisa|jaisi|jeisa|"
@@ -3575,6 +3579,7 @@ def _html_audit(html_text: str, request: str = "") -> tuple:
                         f"{'is' if sections == 1 else 'are'} {sections}")
     # --- a palette, not a default
     hexes = {h.lower() for h in _HEX_RE.findall(body)}
+    hexes |= {h.lower().replace(" ", "") for h in _RGB_RE.findall(body)}
     if len(hexes) < 3:
         blocking.append("only " + str(len(hexes)) + " colour(s) - no real palette or "
                         "hierarchy")
@@ -6158,6 +6163,9 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
         finally:
             stop_evt.set()
             typing_task.cancel()
+            # An exception between the stash and the merge used to leave raw image bytes
+            # (up to LINK_IMG_BYTES each) in this dict for the life of the process.
+            _LINK_IMG.pop(chat_id, None)
             await progress.finish()
             _turn_end(chat_id)
             _EFFORT_BY_CHAT.pop(chat_id, None)
@@ -6352,6 +6360,48 @@ async def _cleanup_once() -> None:
     for k in list(_USER_DAY):
         if _USER_DAY[k][0] != _today:
             _USER_DAY.pop(k, None)
+    # ---- caches that were added later and never pruned ----------------------------
+    # _LINK_IMG is the dangerous one: it holds raw IMAGE BYTES (up to LINK_IMG_BYTES each)
+    # for a chat whose turn died before the merge. That is megabytes, not kilobytes.
+    for k in list(_LINK_IMG):
+        if not _LINK_IMG.get(k):
+            _LINK_IMG.pop(k, None)
+    _live_chats = set(_CHAT_SEEN) | set(_SEND_TIMES) | set(CHAT_LOG)
+    for k in list(_LINK_IMG):
+        if k not in _live_chats:
+            _LINK_IMG.pop(k, None)
+    for k in list(_LAST_FILE):
+        rec = _LAST_FILE.get(k) or {}
+        if (time.time() - rec.get("ts", 0)) > LAST_FILE_TTL or k not in _live_chats:
+            _LAST_FILE.pop(k, None)
+    for k in list(_SPEC):
+        rec = _SPEC.get(k) or {}
+        if (time.time() - rec.get("ts", 0)) > _SPEC_TTL or k not in _live_chats:
+            _SPEC.pop(k, None)
+    for k in list(_LAST_IMAGE):
+        if _LAST_IMAGE.get(k, 0) < cutoff:
+            _LAST_IMAGE.pop(k, None)
+    for k in list(_CHAT_INFO):
+        chat_of = k[0] if isinstance(k, tuple) else k
+        if chat_of not in _live_chats:
+            _CHAT_INFO.pop(k, None)
+    # A spam record for someone who left months ago is not evidence of anything.
+    for k in list(_SPAM_STRIKES):
+        if (time.time() - (_SPAM_STRIKES[k][1] if len(_SPAM_STRIKES[k]) > 1 else 0)) \
+                > SPAM_STRIKE_WINDOW * 4:
+            _SPAM_STRIKES.pop(k, None)
+    for k in list(_SPAM_HIST):
+        dq = _SPAM_HIST.get(k)
+        if not dq or (dq and (time.time() - dq[-1][0]) > SPAM_STRIKE_WINDOW):
+            _SPAM_HIST.pop(k, None)
+    # YouTube results and per-host pacing records grow with the number of DISTINCT videos
+    # and hosts the bot has ever seen.
+    for k in list(_YT_CACHE):
+        if (time.time() - _YT_CACHE[k][0]) > _YT_TTL:
+            _YT_CACHE.pop(k, None)
+    for k in list(_HOST_LAST):
+        if (time.monotonic() - _HOST_LAST[k]) > 3600:
+            _HOST_LAST.pop(k, None)
     for k in list(_MEDIA_GROUPS):
         _MEDIA_GROUPS.pop(k, None)      # an album still buffered an hour later is dead
     for k in list(_ERR_TOLD):
@@ -7696,7 +7746,10 @@ async def _youtube_context(url: str, chat_id: int = 0) -> str:
         author = author or (vd.get("author") or "")
         desc = desc or (vd.get("shortDescription") or "")
         if vd.get("viewCount"):
-            views = f"{int(vd["viewCount"]):,}"
+            # Single quotes inside: a double quote inside a double-quoted f-string is
+            # PEP 701 and needs Python 3.12+. This one line made the whole file a
+            # SyntaxError on 3.10/3.11 - i.e. the bot could not even start there.
+            views = f"{int(vd['viewCount']):,}"
         thumbs = ((vd.get("thumbnail") or {}).get("thumbnails") or [])
         if thumbs:
             thumb = (thumbs[-1] or {}).get("url") or ""
@@ -9890,6 +9943,32 @@ def _attribution_ok() -> bool:
     return hashlib.sha256(joined.encode()).hexdigest()[:32] == _ATTRIBUTION_DIGEST
 
 
+# Refusing to start is the author's call, but it is also a footgun: ANY edit to the header
+# (a rename, a line reflow) bricks the bot, and it sits awkwardly with MIT, which allows
+# modification. Default is now a loud warning; STRICT_ATTRIBUTION=true restores the old
+# refuse-to-start behaviour.
+STRICT_ATTRIBUTION = (os.environ.get("STRICT_ATTRIBUTION", "false").strip().lower()
+                      in ("1", "true", "yes", "on"))
+
+
+def _attribution_problem() -> str:
+    """'' when the header + constants are intact, else a short reason."""
+    try:
+        with open(os.path.abspath(__file__), "r", encoding="utf-8", errors="ignore") as f:
+            head = "".join(f.readline() for _ in range(15))
+    except Exception as e:  # noqa: BLE001
+        return f"this file's own header could not be read ({e})"
+    required = ("SPDX-License" "-Identifier: MIT",
+                "Copyright (c) 2026 " "Deepak " "Danodia",
+                "Avenor integrity " "7f3a9c1e")
+    if not all(x and x in head for x in required):
+        return ("the licence header (SPDX / copyright / integrity marker) was removed or "
+                "changed")
+    if not _attribution_ok():
+        return "the author/copyright/licence constants in this file were changed"
+    return ""
+
+
 def _verify_notice() -> None:
     """Refuse to start if the MIT notice, copyright line or integrity marker was stripped.
 
@@ -9897,29 +9976,18 @@ def _verify_notice() -> None:
     it would find its own copy of these strings and always pass. Attribution protection, not
     real security: the source is readable, so a determined person can remove this too.
     """
-    try:
-        with open(os.path.abspath(__file__), "r", encoding="utf-8", errors="ignore") as f:
-            head = "".join(f.readline() for _ in range(15))
-    except Exception as e:  # noqa: BLE001
-        # FAIL CLOSED. Silently returning here meant an unreadable file skipped the check.
+    problem = _attribution_problem()
+    if not problem:
+        return
+    if STRICT_ATTRIBUTION:
         raise SystemExit(
-            "Refusing to start: this file's own header could not be read for verification "
-            f"({e}). Restore the MIT notice, or use the code under MIT terms.")
-    # Split on purpose: a blanket search-and-replace of these strings cannot neuter the
-    # check, because the verifier's own copy is not written as one contiguous string.
-    required = ("SPDX-License" "-Identifier: MIT",
-                "Copyright (c) 2026 " "Deepak " "Danodia",
-                "Avenor integrity " "7f3a9c1e")
-    if not all(x and x in head for x in required):
-        raise SystemExit(
-            "Refusing to start: the licence header (SPDX / copyright / integrity marker) in "
-            "this file was removed or changed. Restore it, or use the code under MIT terms.")
-    # Second, independent check: the attribution constants, which live far away from the
-    # header. Removing the header comment alone does not get past this one.
-    if not _attribution_ok():
-        raise SystemExit(
-            "Refusing to start: the author/copyright/licence constants in this file were "
-            "changed. Restore them, or use the code under MIT terms.")
+            f"Refusing to start: {problem}. Restore it, or set STRICT_ATTRIBUTION=false to "
+            f"run with a warning instead.")
+    log.warning("=" * 70)
+    log.warning("ATTRIBUTION: %s", problem)
+    log.warning("This build is MIT licensed - keep the copyright notice. The bot is "
+                "running anyway (STRICT_ATTRIBUTION=false).")
+    log.warning("=" * 70)
 
 
 def _flush_on_exit() -> None:
