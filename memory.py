@@ -68,7 +68,6 @@ _AI_NAMES = {
 }
 
 
-# --------------------------------------------------------------------------- io
 def _migrate() -> bool:
     """Bring a just-loaded store up to SCHEMA_VERSION. True if anything changed.
 
@@ -189,7 +188,6 @@ def _touch(obj: dict) -> dict:
     return obj
 
 
-# ----------------------------------------------------------------------- users
 def remember_user(user, chat_id=None, lang=None, chat_type=None) -> None:
     """Record/refresh a user. `user` is a telegram User (or any object with the fields)."""
     if user is None or getattr(user, "is_bot", False):
@@ -327,7 +325,6 @@ def user_summary(user_id) -> str:
         return "What you remember about this person - " + " | ".join(bits) + "."
 
 
-# ---------------------------------------------------- per-user profile / compaction
 def raw_notes(user_id) -> list:
     """The stored raw facts about ONE user (sanitized) - input to the compaction job."""
     with _LOCK:
@@ -408,7 +405,6 @@ def clear_notes(user_id) -> int:
     return n
 
 
-# ------------------------------------------------------------------ reminders
 def add_reminder(user_id, chat_id, text: str, due: float) -> int:
     """Store a reminder for ONE user (isolated by their id). Returns its id, or 0 if rejected."""
     text = safe_mem(text, 200)
@@ -537,7 +533,6 @@ def top_ai(user_id) -> str:
     return max(ai.items(), key=lambda kv: kv[1])[0]
 
 
-# ----------------------------------------------------------------------- chats
 def remember_chat(chat, lang=None, chat_type=None) -> None:
     """Record/refresh a chat (private, group, or channel)."""
     if chat is None:
@@ -603,7 +598,6 @@ def chat_summary(chat_id) -> str:
         return "Chat memory - " + " | ".join(bits) + "."
 
 
-# ----------------------------------------------------------------------- admin
 def get_user(user_id) -> dict:
     with _LOCK:
         load()

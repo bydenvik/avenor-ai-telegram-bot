@@ -1,19 +1,8 @@
-# 22.8.0 is the version this code was tested against. The upper bound is deliberate:
-# the bot depends on bot.send_message_draft (private-chat streaming),
-# MessageLimit.MAX_TEXT_LENGTH and AIORateLimiter(group_time_period=60), all of which
-# may move in a major release.
 python-telegram-bot[rate-limiter]>=22.8,<28
-# 2.25+ is REQUIRED: voice design (client.voices.create) and speech_metadata
-# (the TTS delivery style) do not exist in 1.x.
 google-genai>=2.25
 httpx>=0.27
-tzdata
-# Optional but recommended: gives a bundled ffmpeg so TTS replies arrive as a
-# real Telegram VOICE note (OGG/Opus). Without it, the bot still sends the audio
-# as a normal audio file. Remove this line if you want a lighter build.
-imageio-ffmpeg>=0.4.9
-# OPTIONAL: PyYAML. Without it, a generated .yaml/.yml file is not syntax-checked before it
-# is sent (validate_file() skips it silently). Everything else works without this line.
-# pyyaml>=6.0
-# aiolimiter is pulled in by the [rate-limiter] extra - no separate line needed
 python-dotenv>=1.0
+tzdata
+imageio-ffmpeg>=0.4.9
+# Optional: syntax-checks generated .yaml files before they are sent
+# pyyaml>=6.0
