@@ -10192,6 +10192,87 @@ def _diff_preview(old: str, new: str, limit: int = 900) -> str:
     return t[:limit] + ("\n…" if len(t) > limit else "")
 
 
+_EXCERPT_STOP = {"that", "this", "with", "from", "have", "will", "been", "they", "them",
+                 "then", "than", "when", "what", "which", "your", "into", "also", "just",
+                 "only", "some", "more", "very", "must", "should", "does", "did", "was",
+                 "were", "and", "the", "for", "not", "but", "can", "you", "are", "its"}
+
+
+def _excerpt_for(src: str, topic: str, lessons: list, limit: int = 30000) -> str:
+    """The parts of the file worth showing: around the words in the topic/lessons.
+
+    The old code handed the model src[:40000] - the first 7% of a 530 KB file - so a fix
+    for anything below line ~900 was impossible. Now the matches are located and a window
+    around each one is included, newest evidence first, and the head is kept as context.
+    """
+    keys = set()
+    for blob in [topic or ""] + [str(r.get("detail") or "") for r in (lessons or [])]:
+        keys |= {w for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", blob.lower())
+                 if w not in _EXCERPT_STOP}
+    head = src[:6000]
+    if not keys:
+        return head + "\n…\n" + src[-8000:]
+    lines = src.splitlines()
+    # RARER words locate the code; common ones ("message", "language") match the header and
+    # the whole first 120 lines, which is exactly the region we already have. Keep the ten
+    # rarest keys and search for those.
+    low_all = src.lower()
+    # Only words that actually occur: a topic word like "friendlier" appears nowhere, and
+    # picking it as the "rarest" key left the anchor empty.
+    keys = {k for k in keys if low_all.count(k)}
+    if not keys:
+        return head + "\n…\n" + src[-8000:]
+    keys = set(sorted(keys, key=lambda k: low_all.count(k))[:10])
+    hit_rows = [i for i, ln in enumerate(lines)
+                if any(k in ln.lower() for k in keys)]
+    if not hit_rows:
+        return head + "\n…\n" + src[-8000:]
+    # Build windows of at most 60 lines, then keep the DENSEST ones: 400 hits spread over
+    # 10k lines used to merge into two giant ranges, the first of which ate the whole budget
+    # and hid the very function the topic named.
+    windows = []
+    for i in hit_rows:
+        if windows and i - windows[-1][1] <= 20 and (windows[-1][1] - windows[-1][0]) < 60:
+            windows[-1] = (windows[-1][0], i)
+        else:
+            windows.append((max(0, i - 12), i))
+    windows = [(max(0, lo - 12), min(len(lines), hi + 12)) for lo, hi in windows]
+    def _density(w):
+        lo, hi = w
+        return sum(1 for i in hit_rows if lo <= i <= hi) / max(1, hi - lo)
+    # The RAREST word is the most specific pointer ("busy_msg" names one constant;
+    # "message" names a hundred places). Its first hit is always included, then the densest
+    # windows fill the rest - otherwise the one line the topic named can be crowded out.
+    anchor = []
+    rarest = min(keys, key=lambda k: low_all.count(k))
+    for i, ln in enumerate(lines):
+        if rarest in ln.lower():
+            w = (max(0, i - 15), min(len(lines), i + 40))
+            if w not in anchor:
+                anchor.append(w)
+            if len(anchor) >= 3:          # up to three sightings of the specific word
+                break
+    # The anchors WIN. They were already merged into `windows`, so filtering "anchor not in
+    # windows" produced an empty list and the specific line was dropped again.
+    densest = sorted(windows, key=_density, reverse=True)
+    keep = list(anchor)
+    for w in densest:
+        if len(keep) >= 6:
+            break
+        if w not in keep:
+            keep.append(w)
+    windows = sorted(keep[:6])
+    out = [head, "\n… (skipped) …\n"]
+    budget = limit - len(head) - 200
+    for lo, hi in windows:
+        chunk = "\n".join(f"{n + 1}| {lines[n]}" for n in range(lo, hi))
+        if len(chunk) > budget:
+            break
+        out.append(f"\n--- lines {lo + 1}-{hi} ---\n" + chunk)
+        budget -= len(chunk)
+    return "".join(out)
+
+
 async def _make_proposal(chat_id: int, topic: str) -> tuple:
     """Ask the model for ONE surgical hunk, validate it, and park it for approval."""
     if not SELF_IMPROVE:
@@ -10219,7 +10300,8 @@ async def _make_proposal(chat_id: int, topic: str) -> tuple:
         "matches exactly once; keep it under 40 lines; no subprocess/eval/exec; no secrets; "
         "no new files, no renames, no deletions. If you cannot find a safe small change, "
         "reply with exactly: NOCHANGE",
-        _guard("=== SOURCE EXCERPT ===\n" + src[:40000]))
+        _guard("=== SOURCE EXCERPT (line numbers on the left) ===\n"
+               + _excerpt_for(src, topic, lessons)))
     if not ask or ask.strip().upper().startswith("NOCHANGE"):
         return False, "The model found no safe change to propose."
     m = _PATCH_RE.search(ask)
@@ -10340,6 +10422,21 @@ async def cmd_brain(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["🧠 *Brain*", "",
              f"Self-improvement: {'ON' if SELF_IMPROVE else 'off'}",
              f"GitHub commit: {'ready' if GITHUB_TOKEN else 'no GITHUB_TOKEN (local only)'}",
+             ]
+    if not GITHUB_TOKEN:
+        lines += [
+            "",
+            "*To connect the repo:*",
+            "1. GitHub → Settings → Developer settings → Personal access tokens → "
+            "Fine-grained token",
+            "2. Repository access: only `" + GITHUB_REPO + "`",
+            "3. Permissions → Contents: **Read and write** (nothing else needed)",
+            "4. Render → Environment → add `GITHUB_TOKEN` (and `SELF_IMPROVE=true`), "
+            "then restart",
+        ]
+    if not SELF_IMPROVE:
+        lines += ["", "Self-improvement is OFF. Set `SELF_IMPROVE=true` and restart."]
+    lines += [
              f"Pending proposals: {len(_PROPOSALS)}", "",
              "*Lessons recorded:*", _lesson_stats()]
     if _PROPOSALS:
