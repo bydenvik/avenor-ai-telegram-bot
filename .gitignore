@@ -1,6 +1,11 @@
+# NOTE: this file must be named exactly ".gitignore" - git does not read "gitignore.txt",
+# and while it was named that, none of these rules applied.
+
 # Secrets - never commit these
 .env
 .env.*
+# The template is committed on purpose, and its real name is ".env.example" (the README's
+# `cp .env.example .env` step depends on it), so the negation has to match that exactly.
 !.env.example
 *.pem
 *.key
@@ -19,9 +24,8 @@ dist/
 
 # Runtime state - contains user IDs, names, notes and reminder text
 avenor_memory.json
-videx_memory.json
-linnet_memory.json
 *_memory.json
+avenor_lessons.jsonl
 *.memory.json.tmp
 *.json.tmp
 members.json
