@@ -1738,6 +1738,13 @@ _ANY_TAG_RE = re.compile(
     r"\[(?:react|quote|remember|image|calc|search|file|voice|remind|convert|date|time)"
     r"\b[^\]]*\]", re.I)
 _LEAD_TAG_RE = re.compile(r"^\s*\[react:[^\]]*\]\s*", re.I)
+# The tag list above is a whitelist, so a tag the model INVENTS walks straight into the
+# chat: the 4 Nov screenshot shows "[scream: 😱]" and "[skip: ❌]" delivered as the whole
+# reply. Anything shaped like a tool tag is removed, whatever it is called:
+#   [name: value]  anywhere, and  [name]  alone on a line.
+_TAG_ARG_RE = re.compile(r"\[[A-Za-z_][A-Za-z0-9_\- ]{0,24}:[^\]\n]{0,80}\]")
+_TAG_LINE_RE = re.compile(
+    r"(?m)^[ \t]*\[[A-Za-z_][A-Za-z0-9_\- ]{0,24}(?::[^\]\n]{0,80})?\][ \t]*$")
 
 
 def normalize_emoji(e: str) -> str:
@@ -1775,6 +1782,9 @@ def clean_reply(text: str) -> str:
     t = _AUTO_IMAGE_RE.sub("", t)
     t = _QUOTE_TAG_RE.sub("", _REMEMBER_TAG_RE.sub(
         "", _IMAGE_TAG_RE.sub("", _ANY_TAG_RE.sub("", t))))
+    t = _TAG_LINE_RE.sub("", _TAG_ARG_RE.sub("", t))
+    # a bare [skip] sitting inside otherwise-real prose is still our tag, not theirs
+    t = re.sub(r"(?i)\[\s*skip\s*(?::[^\]\n]*)?\]", "", t)
     t = _strip_unclosed_tags(t)        # "[calc: 15*3" with no "]" must never reach a person
     head = t.split("\n", 1)[0]
     if head.lstrip().startswith("[") and "]" not in head:
@@ -4164,7 +4174,21 @@ _REMEMBER_TAG_RE = re.compile(r"\[\s*remember\s*:\s*([^\]]+)\]", re.I)
 _QUOTE_TAG_RE = re.compile(r"\[\s*quote\s*:\s*([^\]]+)\]", re.I)
 # The model can decline to answer (e.g. a group message clearly meant for someone else) by
 # replying with exactly [skip]. We then send nothing at all - better than a filler reply.
-_SKIP_RE = re.compile(r"^\s*\[?\s*skip\s*\]?\s*[.!]?\s*$", re.I)
+_SKIP_RE = re.compile(r"^\s*\[?\s*skip\s*(?::[^\]\n]*)?\]?\s*[.!]?\s*$", re.I)
+
+
+def _is_skip(text: str) -> bool:
+    """True when the reply is ONLY tags and a skip - i.e. the model chose to stay quiet.
+
+    "[skip]" matched before, but "[skip: ❌]" (with an argument) and a skip preceded by
+    another invented tag did not, so both were sent to the person as literal text.
+    """
+    t = (text or "").strip()
+    if not t or "skip" not in t.lower():
+        return False
+    rest = _TAG_LINE_RE.sub("", _TAG_ARG_RE.sub("", t))
+    rest = _SKIP_RE.sub("", rest).strip()
+    return len(rest) < 12
 # "look at my avatar" / "look at your logo" detection (only used when no media is attached).
 # NOTE: 'image' must be in these lists - the user's own wording is "profile image", and
 _ASK_BOT_PHOTO_RE = re.compile(
@@ -5750,6 +5774,9 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
 
             # ---- SHARED LINKS ---------------------------------------------------
             # If the user pasted a link, fetch its page text NOW so the model can read it.
+            # Initialised here: the [skip] handling below asks whether we hold link data,
+            # and this block does not always run (no URL, or the link budget is spent).
+            link_text = ""
             if (RESEARCH_ENABLED and text and _URL_MSG_RE.search(text)
                     and action_allowed(chat_id, "link")):
                 link_text = _untrusted(await _read_links(text, 2, chat_id))
@@ -6019,9 +6046,15 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             filed_name = ""
             dropped_files = 0
             file_blocked = False
+            _want_pdf = bool(re.search(r"(?i)\bpdf\b", text or ""))
             for fm in list(_FILE_BLOCK_RE.finditer(ans or ""))[:2]:
                 fname, fbody = fm.group(1).strip(), fm.group(2)
                 ans = (ans or "").replace(fm.group(0), "").strip()
+                if _want_pdf and not fname.lower().endswith(".pdf"):
+                    # They asked for a PDF and the model named it .md - the file is text,
+                    # but the delivery must match the request: "ak pdf banao" sent a .md
+                    # with a caption that said "Ye lo PDF file".
+                    fname = (fname.rsplit(".", 1)[0] if "." in fname else fname) + ".pdf"
                 if not fbody.strip():
                     continue
                 filed_bodies.append(fbody)
@@ -6154,9 +6187,33 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                 if emoji:
                     await react_with(msg, emoji)
                     CHAT_LAST_REACT[chat_id] = emoji
-            if _SKIP_RE.match(strip_tag_partial(ans or "")):
-                log.info("model chose [skip] - sending nothing for chat %s", chat_id)
-                return
+            if _is_skip(ans or "") or _SKIP_RE.match(strip_tag_partial(ans or "")):
+                # A skip is right for a group message clearly meant for someone else. It is
+                # WRONG for a direct question the bot was asked and can already answer:
+                # the screenshot shows a YouTube question answered with silence.
+                _aimed = is_private or _addressed_elsewhere(u, c.bot) == ""
+                _have = bool(link_text or pre_research)
+                if _aimed and _have and _turn_allows(chat_id):
+                    log.info("model tried to skip a direct question with data - asking once "
+                             "for the short answer (chat %s)", chat_id)
+                    _r = None
+                    try:
+                        _r = await ask_gemini(
+                            chat_id, prompt,
+                            _guard(ctx + "\n\n=== IMPORTANT ===\nYou already fetched the "
+                                   "data above. Answer the question now in 1-3 short "
+                                   "sentences using it. Do NOT reply with [skip] and do "
+                                   "not emit any tag."),
+                            image, audio, doc)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("skip-retry failed: %s", str(e)[:100])
+                    ans = _r if (_r and _r != BUSY_MSG) else ""
+                    if not clean_reply(ans or ""):
+                        log.info("still nothing after the skip-retry - staying quiet")
+                        return
+                else:
+                    log.info("model chose [skip] - sending nothing for chat %s", chat_id)
+                    return
             if _CANARY and _CANARY in (ans or ""):
                 # The model echoed its own instructions - a leak attempt. Never ship it.
                 log.warning("prompt-leak attempt blocked for chat %s", chat_id)
