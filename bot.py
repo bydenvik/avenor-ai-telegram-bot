@@ -102,7 +102,7 @@ from telegram.ext import (
 from google import genai
 from google.genai import types
 
-# Optional: load a local .env so `cp env.example.txt .env` actually works for local dev.
+# Optional: load a local .env so `cp .env.example .env` actually works for local dev.
 # Python does NOT read .env by itself - without this, a fresh local setup silently had no
 # BOT_TOKEN. Real deployments use the host's environment, and override=False never wins
 # over a real environment variable.
@@ -10120,7 +10120,7 @@ GITHUB_PRIVATE_KEY = (os.environ.get("GITHUB_PRIVATE_KEY", "") or "").replace("\
 _GH_TOKEN_CACHE = {"token": "", "exp": 0.0}
 _IMP_FAILS = 0                 # circuit breaker: 3 bad commits and it stops for this run
 # Only these files may ever be touched. No .env, no secrets, no config of the host.
-IMPROVE_FILES = ("bot.py", "memory.py", "README.md", "env.example.txt")
+IMPROVE_FILES = ("bot.py", "memory.py", "README.md", ".env.example")
 IMPROVE_MAX_LINES = int(os.environ.get("IMPROVE_MAX_LINES", "120") or "120")
 # Anything that can reach outside the process is refused, even inside an approved hunk.
 _IMPROVE_DENY = ("subprocess", "os.system", "os.popen", "eval(", "exec(", "__import__(",

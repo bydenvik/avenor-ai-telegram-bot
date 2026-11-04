@@ -125,11 +125,11 @@ pip install -r requirements.txt
 Create a local environment file from the template:
 
 ```bash
-cp env.example.txt .env
+cp .env.example .env
 ```
 
 The bot loads `.env` itself (via `python-dotenv`), so `python bot.py` picks it up.
-Open `.env` and fill in the values you need. `env.example.txt` lists every supported variable — credentials, model selection, the text-to-speech voice, group behaviour, and memory limits.
+Open `.env` and fill in the values you need. `.env.example` lists every supported variable — credentials, model selection, the text-to-speech voice, group behaviour, and memory limits.
 
 Don't commit `.env`. In production, set the same values through your host's secret or environment settings.
 
@@ -147,7 +147,7 @@ The process starts and begins polling Telegram. The same command works under any
 
 ## Configuration
 
-All runtime settings come from environment variables. See `env.example.txt` for the full list, the default values, and a short note on each one.
+All runtime settings come from environment variables. See `.env.example` for the full list, the default values, and a short note on each one. Editing that file changes nothing on its own — it is a template; the bot reads the real environment (Render → Environment).
 
 The bot's own @handle is read from Telegram at startup (`getMe`), so the attribution line in
 every generated file, the User-Agent and `/about` always show the real one. `BOT_HANDLE`
@@ -196,7 +196,8 @@ avenor-ai-telegram-bot/
 ├── bot.py              Main application logic (kept as one file on purpose)
 ├── memory.py           Persistent JSON store for users and chats
 ├── requirements.txt    Python dependencies
-├── env.example.txt     Environment variable template
+├── .env.example        Environment variable template (a template: the bot reads the real
+│                       environment, so editing this file changes nothing by itself)
 ├── privacy-policy.md   Privacy policy
 ├── .gitignore          Ignore rules — the file MUST be named exactly ".gitignore".
 │                       Git does not read "gitignore.txt", which would leave .env and the
@@ -242,7 +243,7 @@ The bot can propose a change to its own source code, and it can never apply one 
 1. `/improve [topic]` (owner, private chat) makes it review the failures it has recorded and
    write **one** surgical hunk - exact old lines, exact new lines, one line of reasoning.
 2. The hunk is validated before you even see it: the file must be on an allowlist
-   (`bot.py`, `memory.py`, `README.md`, `env.example.txt`), the old block must match the file
+   (`bot.py`, `memory.py`, `README.md`, `.env.example`), the old block must match the file
    exactly once, the hunk must be under `IMPROVE_MAX_LINES`, and it may not contain
    `subprocess`/`eval`/`exec`/shell text or anything that looks like a secret.
 3. You get the diff with **Apply & commit** / **Reject**.
@@ -418,7 +419,7 @@ If you run Avenor as a public service, you are the data controller for the recor
 Issues and pull requests are welcome.
 
 - Don't commit secrets or `.env`.
-- If you add a config variable, document it in `env.example.txt`.
+- If you add a config variable, document it in `.env.example`.
 - Keep `bot.py` as a single file. That's on purpose.
 
 ---
