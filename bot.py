@@ -10489,7 +10489,8 @@ async def cmd_improve(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not SELF_IMPROVE:
         await u.message.reply_text(
-            "Self-improvement is off. Set SELF_IMPROVE=true in the environment and restart.")
+            "Self-improvement is off.\n\nSet SELF_IMPROVE=true in Render → Environment, then "
+            "redeploy.\nRun /brain to see exactly what is still missing.")
         return
     topic = " ".join(c.args).strip() if c.args else ""
     msg = await u.message.reply_text("🧠 Reviewing recent failures and writing a proposal…")
@@ -10510,40 +10511,51 @@ async def cmd_improve(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_brain(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: what the bot has learned about its own failures."""
+    """Owner-only: what the bot has learned, and exactly what is still missing to enable it."""
     if not is_owner(u.effective_user):
         await u.message.reply_text("That command is owner-only.")
         return
+
+    app_ready = bool(GITHUB_APP_ID and GITHUB_INSTALLATION_ID and GITHUB_PRIVATE_KEY)
+    cred = ("GitHub App (1-hour token)" if app_ready
+            else ("personal token" if GITHUB_TOKEN else "none"))
+
     lines = ["🧠 *Brain*", "",
-             f"Self-improvement: {'ON' if SELF_IMPROVE else 'off'}",
-             f"Repo: {GITHUB_REPO or '(not set - commits disabled)'} @ {GITHUB_BRANCH}",
-             "Credential: " + ("GitHub App (short-lived)" if (GITHUB_APP_ID and
-                                GITHUB_PRIVATE_KEY) else
-                                ("personal token" if GITHUB_TOKEN else "none")),
-             f"Mode: {'DRY RUN (validates, never writes)' if SELF_IMPROVE_DRY_RUN else 'live'}",
-             "Can: edit one allowlisted file, one hunk, after your approval.",
-             "Cannot: create a repo, delete, rename, touch .env or another repo.",
-             ]
-    if not GITHUB_TOKEN:
-        lines += [
-            "",
-            "*To connect the repo:*",
-            "1. GitHub → Settings → Developer settings → Personal access tokens → "
-            "Fine-grained token",
-            "2. Repository access: only `" + GITHUB_REPO + "`",
-            "3. Permissions → Contents: **Read and write** (nothing else needed)",
-            "4. Render → Environment → add `GITHUB_TOKEN` (and `SELF_IMPROVE=true`), "
-            "then restart",
-        ]
+             f"*Self-improvement:* {'ON' if SELF_IMPROVE else 'OFF'}",
+             f"*Repo:* {GITHUB_REPO or '(not set — commits disabled)'} @ {GITHUB_BRANCH}",
+             f"*Credential:* {cred}",
+             f"*Mode:* {'DRY RUN (validates, never writes)' if SELF_IMPROVE_DRY_RUN else 'live'}",
+             "",
+             "*Can:* edit one allowlisted file, one hunk, after your approval.",
+             "*Cannot:* create a repo, delete, rename, touch .env or any other repo.",
+             "",
+             f"*Pending proposals:* {len(_PROPOSALS)}"]
+
+    # ---- exactly the steps that are still missing, in order ------------------------------
+    todo = []
     if not SELF_IMPROVE:
-        lines += ["", "Self-improvement is OFF. Set `SELF_IMPROVE=true` and restart."]
-    lines += [
-             f"Pending proposals: {len(_PROPOSALS)}", "",
-             "*Lessons recorded:*", _lesson_stats()]
+        todo.append("Set `SELF_IMPROVE=true` in Render → Environment, then redeploy.")
+    if not GITHUB_REPO:
+        todo.append("Set `GITHUB_REPO=owner/name` (the repo you want it to work on).")
+    if cred == "none":
+        # ONE numbered item per action: splitting a single instruction over four list entries
+        # made the list read "3. Personal access tokens → …" as if it were a separate step.
+        todo.append("Create a fine-grained token: GitHub → Settings → Developer settings → "
+                    "Personal access tokens → Fine-grained → repository access: only `"
+                    + (GITHUB_REPO or "this one") + "` → Permissions → Contents: *Read and "
+                    "write* → Generate.")
+        todo.append("Add `GITHUB_TOKEN` in Render → Environment, then redeploy.")
+    if todo:
+        lines += ["", "*Still needed:*"] + [f"{n}. {t}" for n, t in enumerate(todo, 1)]
+    if SELF_IMPROVE and cred != "none":
+        lines += ["", "Ready. Try `/improve BUSY_MSG` (a name works better than a sentence)."]
+
+    lines += ["", "*Lessons recorded:*", _lesson_stats()]
     if _PROPOSALS:
         lines += ["", "*Waiting for you:*"] + [f"• {k} — {v['why'][:60]}"
                                                for k, v in list(_PROPOSALS.items())[-4:]]
     lines += ["", "Commands: /improve [topic]  ·  /brain"]
+
     for chunk in split_text("\n".join(lines)):
         await _safe_send(u, c, md_to_html(chunk), chunk)
 
