@@ -272,7 +272,11 @@ access", not who said what. IDs, @usernames, emails and phone numbers are replac
 `[id]` before a note is written, and the chat it came from is not recorded. That is why this
 is not a privacy problem: a lesson about the bot's own bug is not personal data.
 
-Set `SELF_IMPROVE=true` to turn any of this on. It is off by default.
+**Is it on?** `SELF_IMPROVE` is three-state: `true` forces it on, `false` forces it off,
+and **unset means "on when a GitHub credential exists"** - because without a credential
+there is nothing to enable (an apply could only write a local file), and with one you still
+approve every hunk by hand. `/brain` always shows which of the three is in effect, and
+`/improve on` / `/improve off` override it for the current run.
 
 ## Group safety
 

@@ -10092,8 +10092,17 @@ def _safety_report() -> str:
 # ============================ PART 17d: SELF-IMPROVEMENT (owner-gated) ==================
 # The bot may PROPOSE a change to its own source. It may never apply one by itself: the
 # owner sees the diff in a private chat and taps Apply. Nothing here runs for a normal user.
-SELF_IMPROVE = (os.environ.get("SELF_IMPROVE", "false").strip().lower()
-                in ("1", "true", "yes", "on"))
+_SELF_IMPROVE_ENV = os.environ.get("SELF_IMPROVE", "").strip().lower()
+if _SELF_IMPROVE_ENV in ("1", "true", "yes", "on"):
+    SELF_IMPROVE = True
+elif _SELF_IMPROVE_ENV in ("0", "false", "no", "off"):
+    SELF_IMPROVE = False
+else:
+    # Not set: follow the credential. Without one there is nothing to enable (an apply
+    # could only write the local file), and WITH one the owner still has to approve every
+    # single hunk - so this is the setting that removes a pointless failure mode.
+    SELF_IMPROVE = False        # filled in below, once the credential vars are read
+_SELF_IMPROVE_AUTO = _SELF_IMPROVE_ENV == ""
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "bydenvik/avenor-ai-telegram-bot").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
@@ -10118,6 +10127,12 @@ GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID", "").strip()
 GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID", "").strip()
 GITHUB_PRIVATE_KEY = (os.environ.get("GITHUB_PRIVATE_KEY", "") or "").replace("\\n", "\n")
 _GH_TOKEN_CACHE = {"token": "", "exp": 0.0}
+if _SELF_IMPROVE_AUTO:
+    SELF_IMPROVE = bool(GITHUB_TOKEN or (GITHUB_APP_ID and GITHUB_INSTALLATION_ID
+                                        and GITHUB_PRIVATE_KEY))
+    if SELF_IMPROVE:
+        log.info("self-improvement: ON (SELF_IMPROVE unset, but a GitHub credential is "
+                 "present - owner approval is still required for every change)")
 _IMP_FAILS = 0                 # circuit breaker: 3 bad commits and it stops for this run
 # Only these files may ever be touched. No .env, no secrets, no config of the host.
 IMPROVE_FILES = ("bot.py", "memory.py", "README.md", ".env.example")
@@ -10554,7 +10569,11 @@ async def cmd_brain(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             else ("personal token" if GITHUB_TOKEN else "none"))
 
     lines = ["🧠 *Brain*", "",
-             f"*Self-improvement:* {'ON' if SELF_IMPROVE else 'OFF'}",
+             "*Self-improvement:* " + ("ON" if SELF_IMPROVE else "OFF")
+             + ("  (auto: a credential is set)" if (SELF_IMPROVE and _SELF_IMPROVE_AUTO)
+                else ("  (SELF_IMPROVE=true)" if SELF_IMPROVE else
+                      ("  (SELF_IMPROVE=false)" if _SELF_IMPROVE_ENV else
+                       "  (no GitHub credential yet)"))),
              f"*Repo:* {GITHUB_REPO or '(not set — commits disabled)'} @ {GITHUB_BRANCH}",
              f"*Credential:* {cred}",
              f"*Mode:* {'DRY RUN (validates, never writes)' if SELF_IMPROVE_DRY_RUN else 'live'}",
