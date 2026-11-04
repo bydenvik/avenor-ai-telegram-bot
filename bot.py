@@ -10480,18 +10480,51 @@ async def _apply_proposal(pid: str) -> tuple:
 
 
 async def cmd_improve(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
-    """Owner-only: propose one change to the bot's own source. Never applies it itself."""
+    """Owner-only: propose one change to the bot's own source, or switch the feature on/off."""
+    global SELF_IMPROVE
     if not is_owner(u.effective_user):
         await u.message.reply_text("That command is owner-only.")
         return
     if u.effective_chat.type != "private":
         await u.message.reply_text("Run /improve in my private chat - the diff is code.")
         return
+
+    arg = (c.args[0].strip().lower() if c.args else "")
+
+    # ---- /improve on | off -------------------------------------------------------------
+    if arg in ("on", "off"):
+        if arg == "off":
+            SELF_IMPROVE = False
+            await u.message.reply_text(
+                "🔴 Self-improvement OFF (this run only).\n"
+                "Set SELF_IMPROVE=false in Render to make that permanent.")
+            return
+        has_cred = bool(GITHUB_TOKEN or (GITHUB_APP_ID and GITHUB_PRIVATE_KEY))
+        SELF_IMPROVE = True
+        lines = ["🟢 Self-improvement ON (this run only).",
+                 "",
+                 f"Repo: {GITHUB_REPO or '(not set - commits disabled)'} @ {GITHUB_BRANCH}",
+                 "Credential: " + ("ready" if has_cred else
+                                    "NONE - apply would only write the local file, which "
+                                    "Render throws away on restart"),
+                 f"Mode: {'DRY RUN' if SELF_IMPROVE_DRY_RUN else 'live'}"]
+        if not has_cred:
+            lines += ["", "Add GITHUB_TOKEN in Render → Environment for real commits."]
+        lines += ["",
+                  "This switch lives in memory: a restart puts it back to whatever "
+                  "SELF_IMPROVE says in the environment.",
+                  "",
+                  "Now try: /improve BUSY_MSG"]
+        await u.message.reply_text("\n".join(lines))
+        return
+
     if not SELF_IMPROVE:
         await u.message.reply_text(
-            "Self-improvement is off.\n\nSet SELF_IMPROVE=true in Render → Environment, then "
-            "redeploy.\nRun /brain to see exactly what is still missing.")
+            "Self-improvement is off.\n\n"
+            "Quick: /improve on   (this run only)\n"
+            "Permanent: set SELF_IMPROVE=true in Render → Environment, then redeploy.")
         return
+
     topic = " ".join(c.args).strip() if c.args else ""
     msg = await u.message.reply_text("🧠 Reviewing recent failures and writing a proposal…")
     ok, out = await _make_proposal(u.effective_chat.id, topic)
@@ -10547,6 +10580,8 @@ async def cmd_brain(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         todo.append("Add `GITHUB_TOKEN` in Render → Environment, then redeploy.")
     if todo:
         lines += ["", "*Still needed:*"] + [f"{n}. {t}" for n, t in enumerate(todo, 1)]
+        if not SELF_IMPROVE:
+            lines += ["", "Quick switch for this run only: `/improve on`"]
     if SELF_IMPROVE and cred != "none":
         lines += ["", "Ready. Try `/improve BUSY_MSG` (a name works better than a sentence)."]
 
