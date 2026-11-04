@@ -179,6 +179,9 @@ One setting is worth calling out: **`POLLINATIONS_TEXT_ENABLED` is off by defaul
 
 `/safety` — spam + malicious-file rules and the last few blocks (admin-only)
 
+`/improve [topic]` `/brain` — owner only: the bot proposes a change to its own source
+(you approve it with a button), and shows what it has learned from its failures
+
 `/diag` `/voicecreate` `/voicelist` `/voicefind` — owner only
 
 Everything else works without a command: send a photo, a voice note, a document, a link,
@@ -231,6 +234,27 @@ Memory is kept per user, keyed by their Telegram ID, and only ever injected into
 - Free services sleep after ~15 minutes idle. Ping `/health` every 5 minutes from an uptime monitor to keep it awake (this also keeps memory alive).
 
 ---
+
+## Self-improvement (owner-gated)
+
+The bot can propose a change to its own source code, and it can never apply one on its own:
+
+1. `/improve [topic]` (owner, private chat) makes it review the failures it has recorded and
+   write **one** surgical hunk - exact old lines, exact new lines, one line of reasoning.
+2. The hunk is validated before you even see it: the file must be on an allowlist
+   (`bot.py`, `memory.py`, `README.md`, `env.example.txt`), the old block must match the file
+   exactly once, the hunk must be under `IMPROVE_MAX_LINES`, and it may not contain
+   `subprocess`/`eval`/`exec`/shell text or anything that looks like a secret.
+3. You get the diff with **Apply & commit** / **Reject**.
+4. Apply re-validates, applies to a temp copy, runs `ast.parse` and `py_compile`, and only
+   then commits through the GitHub API (or writes locally when no `GITHUB_TOKEN` is set).
+   Any failure means nothing is written.
+
+Delete, rename and new-file creation are refused outright. `/brain` shows the lessons the bot
+has recorded about its own mistakes (a denied capability, a wrong skip, a promised file that
+was never attached, a provider outage) - recorded silently, never in the chat.
+
+Set `SELF_IMPROVE=true` to turn any of this on. It is off by default.
 
 ## Group safety
 

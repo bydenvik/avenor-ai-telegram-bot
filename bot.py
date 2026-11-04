@@ -76,6 +76,9 @@ import wave
 import random
 import shutil
 import zipfile
+import sys
+import subprocess
+import tempfile
 import asyncio
 import atexit
 import logging
@@ -3127,11 +3130,23 @@ def _needs_live(text: str) -> bool:
 
 
 # The model's classic excuse - if we see it, we fetch and ask again rather than shipping it.
+# "The model denies a capability it actually has." The 4 Nov screenshot: it told the user
+# "Mujhe real-time web search karne ki ability nahi hai ... main apne training data tak ki
+# jaanhari (2024 tak) de sakta hoon" - while the bot was holding a working search layer.
+# Every phrasing that means "I cannot see the live web" belongs here.
 _NO_ACCESS_RE = re.compile(
-    r"real[- ]?time\s+(data|access|info|market)|live\s+(data|access)|"
+    r"real[- ]?time\s+(web\s*)?(search|data|access|info|market|stats|information)|"
+    r"live\s+(data|access|search|web)|"
     r"access\s+nahi|internet\s+(ka\s+)?access\s+nahi|"
-    r"(can'?t|cannot|do\s+not|don'?t)\s+(have\s+)?access|"
-    r"internet\s+par\s+live|live\s+data\s+dekhna", re.I)
+    r"(can'?t|cannot|do\s+not|don'?t|unable\s+to)\s+(have\s+)?(real[- ]?time\s+)?"
+    r"(web\s*)?(access|search)|"
+    r"no\s+(internet|web)\s+access|"
+    r"internet\s+par\s+live|live\s+data\s+dekhna|"
+    r"(ability|access)\s+nahi\s+hai|"
+    r"web\s*search\s+karne\s+ki\s+(ability|access)|"
+    r"search\s+(karne\s+ki\s+)?ability\s+nahi|"
+    r"training\s+data|knowledge\s+cut[- ]?off|"
+    r"(2023|2024|2025)\s+tak\s+ki\s+(jaan?kari|jaankari|information|knowledge)", re.I)
 
 # Per-kind budgets. One global number was too blunt: a file costs nothing (local bytes) while
 # an image hits Pollinations' ~45s-per-IP gate, so the tight limit belongs on images only.
@@ -4749,6 +4764,8 @@ PUBLIC_COMMANDS = [
     ("members", "Members I have seen"),
 ]
 OWNER_COMMANDS = [
+    ("improve", "Propose a change to my own code (owner)"),
+    ("brain", "What I have learned about my failures (owner)"),
     ("diag", "Diagnostics + live self-test"),
     ("voicecreate", "Design a custom voice"),
     ("voicelist", "Your custom voices"),
@@ -5960,6 +5977,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
             # If it STILL claims it has no live access, fetch and ask once more instead of
             # shipping that excuse to the user.
             if (RESEARCH_ENABLED and text and _NO_ACCESS_RE.search(ans or "")):
+                _lesson("denied_capability", ans, chat_id)
                 # The model claimed it has no live access. If pre-flight research already
                 # fetched data, REUSE it (no second lookup, no extra budget); otherwise fetch
                 # now - but only if the search budget still allows it.
@@ -6213,6 +6231,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                         return
                 else:
                     log.info("model chose [skip] - sending nothing for chat %s", chat_id)
+                    _lesson("wrong_skip", text or ans, chat_id)
                     return
             if _CANARY and _CANARY in (ans or ""):
                 # The model echoed its own instructions - a leak attempt. Never ship it.
@@ -6225,6 +6244,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                            hinglish="Ye meri internal baat hai, iske baare me main nahi "
                                     "bata sakta. Aur kuch poochho - madad karta hoon.")
             if (ans or "").strip() == BUSY_MSG:
+                _lesson("model_busy", text, chat_id)
                 # Every model (Gemini -> Groq -> Pollinations) is unavailable. A factual
                 # question should still be answered, so use the live sources directly
                 # instead of shipping "I am busy" to someone who asked a real question.
@@ -6292,6 +6312,7 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
                     clean = _caption_for_attachment(clean, _fname)
                     log.info("auto-attached a file for chat %s (plain-word request)", chat_id)
             if not file_sent and _promised:
+                _lesson("promise_no_file", clean, chat_id)
                 # We could not build it. Do not leave the promise standing - say the truth.
                 clean = _strip_attachment_claims(clean)
                 if not clean.strip():
@@ -6373,6 +6394,8 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     q = u.callback_query
     await q.answer()
     d = q.data
+    if (d or "").startswith("imp_"):
+        return await _improve_button(u, c)
     if d == "capture":
         remember_member(q.message.chat_id, q.from_user)
         try:
@@ -10065,6 +10088,288 @@ def _safety_report() -> str:
     return "\n".join(out)
 
 
+
+# ============================ PART 17d: SELF-IMPROVEMENT (owner-gated) ==================
+# The bot may PROPOSE a change to its own source. It may never apply one by itself: the
+# owner sees the diff in a private chat and taps Apply. Nothing here runs for a normal user.
+SELF_IMPROVE = (os.environ.get("SELF_IMPROVE", "false").strip().lower()
+                in ("1", "true", "yes", "on"))
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "bydenvik/avenor-ai-telegram-bot").strip()
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
+# Only these files may ever be touched. No .env, no secrets, no config of the host.
+IMPROVE_FILES = ("bot.py", "memory.py", "README.md", "env.example.txt")
+IMPROVE_MAX_LINES = int(os.environ.get("IMPROVE_MAX_LINES", "120") or "120")
+# Anything that can reach outside the process is refused, even inside an approved hunk.
+_IMPROVE_DENY = ("subprocess", "os.system", "os.popen", "eval(", "exec(", "__import__(",
+                 "shutil.rmtree", "rm -rf", "socket.", "urllib.request", "requests.get(")
+_LESSONS_FILE = os.path.join(_HERE, "avenor_lessons.jsonl")
+_LESSONS_MAX = 400
+_PROPOSALS: dict = {}          # id -> {file, old, new, why, topic, ts}
+
+
+def _lesson(kind: str, detail: str, chat_id: int = 0) -> None:
+    """Record one thing that went wrong. Silent, bounded, never raises."""
+    try:
+        row = {"ts": int(time.time()), "kind": str(kind)[:40],
+               "detail": re.sub(r"\s+", " ", str(detail or ""))[:300],
+               "chat": int(chat_id or 0)}
+        with open(_LESSONS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        if os.path.getsize(_LESSONS_FILE) > 300_000:      # keep the file small
+            lines = open(_LESSONS_FILE, encoding="utf-8").read().splitlines()[-_LESSONS_MAX:]
+            open(_LESSONS_FILE, "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    except Exception as e:  # noqa: BLE001
+        log.debug("lesson not recorded: %s", str(e)[:80])
+
+
+def _recent_lessons(n: int = 8) -> list:
+    try:
+        rows = []
+        with open(_LESSONS_FILE, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:  # noqa: BLE001
+                        continue
+        return rows[-n:]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _lesson_stats() -> str:
+    rows = _recent_lessons(400)
+    if not rows:
+        return "No lessons recorded yet."
+    from collections import Counter
+    c = Counter(r.get("kind", "?") for r in rows)
+    return "\n".join(f"• {k}: {v}" for k, v in c.most_common(10))
+
+
+_PATCH_RE = re.compile(
+    r"FILE:\s*([A-Za-z0-9_.\-]+)\s*\n"
+    r"WHY:\s*([^\n]{1,200})\n"
+    r"OLD:\s*\n<<<\s*\n(.*?)\n?>>>\s*\n"
+    r"NEW:\s*\n<<<\s*\n(.*?)\n?>>>", re.S)
+
+
+def _safe_hunk(name: str, old: str, new: str) -> str:
+    """'' when the hunk is acceptable, else the reason it is not."""
+    if name not in IMPROVE_FILES:
+        return f"{name} is not on the allowlist ({', '.join(IMPROVE_FILES)})"
+    path = os.path.join(_HERE, name)
+    if not os.path.isfile(path):
+        return f"{name} does not exist here"
+    try:
+        body = open(path, encoding="utf-8").read()
+    except Exception as e:  # noqa: BLE001
+        return f"could not read {name}: {e}"
+    if not old.strip():
+        return "the OLD block is empty"
+    if body.count(old) != 1:
+        return f"the OLD block matches {body.count(old)} times (must match exactly once)"
+    if len(old.splitlines()) + len(new.splitlines()) > IMPROVE_MAX_LINES:
+        return f"the hunk is too large (limit {IMPROVE_MAX_LINES} lines)"
+    low = new.lower()
+    for bad in _IMPROVE_DENY:
+        if bad in low:
+            return f"the new text contains '{bad}' - refused"
+    if re.search(r"AIza[0-9A-Za-z_\-]{20,}|gsk_[0-9A-Za-z]{20,}|\d{8,10}:[A-Za-z0-9_\-]{30,}",
+                 new):
+        return "the new text looks like it contains a secret"
+    return ""
+
+
+def _diff_preview(old: str, new: str, limit: int = 900) -> str:
+    out = []
+    for ln in old.splitlines()[:14]:
+        out.append("- " + ln[:120])
+    for ln in new.splitlines()[:14]:
+        out.append("+ " + ln[:120])
+    t = "\n".join(out)
+    return t[:limit] + ("\n…" if len(t) > limit else "")
+
+
+async def _make_proposal(chat_id: int, topic: str) -> tuple:
+    """Ask the model for ONE surgical hunk, validate it, and park it for approval."""
+    if not SELF_IMPROVE:
+        return False, ("Self-improvement is off. Set SELF_IMPROVE=true and restart "
+                       "(it stays owner-only and approval-gated).")
+    lessons = _recent_lessons(8)
+    evidence = "\n".join(f"- [{r.get('kind')}] {r.get('detail')}" for r in lessons) or "- (none)"
+    target = "bot.py"
+    try:
+        src = open(os.path.join(_HERE, target), encoding="utf-8").read()
+    except Exception as e:  # noqa: BLE001
+        return False, f"could not read {target}: {e}"
+    # Give the model the region around whatever it is asked to fix, not 10k lines.
+    ask = await ask_gemini(
+        chat_id,
+        "Propose ONE small, surgical code change to this Telegram bot.\n"
+        f"Topic: {topic or 'the most recent failures'}\n\n"
+        f"Recent recorded failures:\n{evidence}\n\n"
+        "Reply in EXACTLY this format and nothing else:\n"
+        "FILE: bot.py\n"
+        "WHY: <one line>\n"
+        "OLD:\n<<<\n<exact lines copied from the file, 1-40 lines>\n>>>\n"
+        "NEW:\n<<<\n<the replacement lines>\n>>>\n\n"
+        "Rules: the OLD block must be copied character-for-character from the file so it "
+        "matches exactly once; keep it under 40 lines; no subprocess/eval/exec; no secrets; "
+        "no new files, no renames, no deletions. If you cannot find a safe small change, "
+        "reply with exactly: NOCHANGE",
+        _guard("=== SOURCE EXCERPT ===\n" + src[:40000]))
+    if not ask or ask.strip().upper().startswith("NOCHANGE"):
+        return False, "The model found no safe change to propose."
+    m = _PATCH_RE.search(ask)
+    if not m:
+        return False, "The model's reply was not in the patch format - nothing was changed."
+    name, why, old, new = m.group(1).strip(), m.group(2).strip(), m.group(3), m.group(4)
+    problem = _safe_hunk(name, old, new)
+    if problem:
+        return False, f"Rejected before you saw it: {problem}"
+    pid = hashlib.sha1((name + old + new + str(time.time())).encode()).hexdigest()[:8]
+    _PROPOSALS[pid] = {"file": name, "old": old, "new": new, "why": why,
+                       "topic": topic, "ts": time.time()}
+    if len(_PROPOSALS) > 6:                      # keep only the newest few
+        for k in sorted(_PROPOSALS, key=lambda k: _PROPOSALS[k]["ts"])[:-6]:
+            _PROPOSALS.pop(k, None)
+    return True, pid
+
+
+async def _apply_proposal(pid: str) -> tuple:
+    """Apply an approved hunk: validate in a temp copy, then commit. Nothing partial."""
+    prop = _PROPOSALS.get(pid)
+    if not prop:
+        return False, "That proposal has expired."
+    name, old, new = prop["file"], prop["old"], prop["new"]
+    problem = _safe_hunk(name, old, new)         # re-check: the file may have changed
+    if problem:
+        return False, f"Refused: {problem}"
+    path = os.path.join(_HERE, name)
+    body = open(path, encoding="utf-8").read()
+    updated = body.replace(old, new, 1)
+
+    # 1) it must still be valid Python before anything is written
+    if name.endswith(".py"):
+        try:
+            ast.parse(updated)
+        except SyntaxError as e:
+            return False, f"Refused: the change does not parse (line {e.lineno}: {e.msg})"
+        tmpdir = tempfile.mkdtemp(prefix="imp_")
+        tmp = os.path.join(tmpdir, name)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(updated)
+        try:
+            r = subprocess.run([sys.executable, "-m", "py_compile", tmp],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                return False, "Refused: py_compile failed -\n" + (r.stderr or "")[:400]
+        except Exception as e:  # noqa: BLE001
+            return False, f"Refused: could not compile the change ({str(e)[:120]})"
+
+    # 2) commit
+    if not GITHUB_TOKEN:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(updated)
+        _PROPOSALS.pop(pid, None)
+        return True, ("Applied to the local file only (no GITHUB_TOKEN set, so no "
+                      "commit). Restart the bot to use it.")
+    try:
+        api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{name}"
+        hdrs = {"Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "AvenorSelfImprove/1.0"}
+        cur = await HTTP.get(api, params={"ref": GITHUB_BRANCH}, headers=hdrs, timeout=20)
+        if cur.status_code != 200:
+            return False, f"GitHub read failed ({cur.status_code}) - nothing was committed."
+        sha = (cur.json() or {}).get("sha", "")
+        payload = {"message": f"self-improve: {prop['why'][:60]}\n\n{prop['topic'][:200]}",
+                   "content": base64.b64encode(updated.encode()).decode(),
+                   "branch": GITHUB_BRANCH}
+        if sha:
+            payload["sha"] = sha
+        put = await HTTP.put(api, json=payload, headers=hdrs, timeout=30)
+        if put.status_code not in (200, 201):
+            return False, f"GitHub commit failed ({put.status_code}) - nothing was committed."
+        url = ((put.json() or {}).get("commit") or {}).get("html_url", "")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(updated)
+        _PROPOSALS.pop(pid, None)
+        return True, f"Committed to {GITHUB_REPO}@{GITHUB_BRANCH}.\n{url}"
+    except Exception as e:  # noqa: BLE001
+        return False, f"Commit failed ({str(e)[:150]}) - nothing was committed."
+
+
+async def cmd_improve(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: propose one change to the bot's own source. Never applies it itself."""
+    if not is_owner(u.effective_user):
+        await u.message.reply_text("That command is owner-only.")
+        return
+    if u.effective_chat.type != "private":
+        await u.message.reply_text("Run /improve in my private chat - the diff is code.")
+        return
+    if not SELF_IMPROVE:
+        await u.message.reply_text(
+            "Self-improvement is off. Set SELF_IMPROVE=true in the environment and restart.")
+        return
+    topic = " ".join(c.args).strip() if c.args else ""
+    msg = await u.message.reply_text("🧠 Reviewing recent failures and writing a proposal…")
+    ok, out = await _make_proposal(u.effective_chat.id, topic)
+    if not ok:
+        await msg.edit_text("Nothing to apply.\n\n" + out)
+        return
+    pid = out
+    prop = _PROPOSALS[pid]
+    body = (f"🧠 *Proposal {pid}*\n\n"
+            f"*File:* `{prop['file']}`\n*Why:* {prop['why']}\n\n"
+            f"```diff\n{_diff_preview(prop['old'], prop['new'])}\n```")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Apply & commit", callback_data=f"imp_ok:{pid}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"imp_no:{pid}"),
+    ]])
+    await msg.edit_text(body, parse_mode="Markdown", reply_markup=kb)
+
+
+async def cmd_brain(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Owner-only: what the bot has learned about its own failures."""
+    if not is_owner(u.effective_user):
+        await u.message.reply_text("That command is owner-only.")
+        return
+    lines = ["🧠 *Brain*", "",
+             f"Self-improvement: {'ON' if SELF_IMPROVE else 'off'}",
+             f"GitHub commit: {'ready' if GITHUB_TOKEN else 'no GITHUB_TOKEN (local only)'}",
+             f"Pending proposals: {len(_PROPOSALS)}", "",
+             "*Lessons recorded:*", _lesson_stats()]
+    if _PROPOSALS:
+        lines += ["", "*Waiting for you:*"] + [f"• {k} — {v['why'][:60]}"
+                                               for k, v in list(_PROPOSALS.items())[-4:]]
+    lines += ["", "Commands: /improve [topic]  ·  /brain"]
+    for chunk in split_text("\n".join(lines)):
+        await _safe_send(u, c, md_to_html(chunk), chunk)
+
+
+async def _improve_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
+    """Apply / reject a proposal. Owner only, and only from a private chat."""
+    q = u.callback_query
+    data = q.data or ""
+    if not is_owner(q.from_user):
+        await q.answer("Owner only.", show_alert=True)
+        return
+    if q.message and q.message.chat.type != "private":
+        await q.answer("Do this in my private chat.", show_alert=True)
+        return
+    pid = data.split(":", 1)[1] if ":" in data else ""
+    if data.startswith("imp_no"):
+        _PROPOSALS.pop(pid, None)
+        await q.edit_message_text("❌ Rejected. Nothing was changed.")
+        return
+    await q.answer("Applying…")
+    ok, msg = await _apply_proposal(pid)
+    await q.edit_message_text(("✅ " if ok else "⚠️ ") + msg[:3500])
+
+
 # ============================ PART 18: MAIN ============================
 def _build_app() -> Application:
     global _RATE_LIMITER_ON
@@ -10107,6 +10412,8 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("research", cmd_research))
     app.add_handler(CommandHandler("welcome", cmd_welcome))
     app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("improve", cmd_improve))
+    app.add_handler(CommandHandler("brain", cmd_brain))
     app.add_handler(CommandHandler("safety", cmd_safety))
     app.add_handler(CommandHandler("image", cmd_image))
     app.add_handler(CommandHandler("memory", cmd_memory))
