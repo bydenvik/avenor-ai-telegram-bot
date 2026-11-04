@@ -10097,6 +10097,28 @@ SELF_IMPROVE = (os.environ.get("SELF_IMPROVE", "false").strip().lower()
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "bydenvik/avenor-ai-telegram-bot").strip()
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main").strip() or "main"
+# THE REPO IS NOT THE MODEL'S CHOICE. It is this one string, set by the owner in the
+# environment. The code can only ever call
+#   /repos/{GITHUB_REPO}/contents/{one of IMPROVE_FILES}
+# There is no call anywhere that creates a repository, and no way for a chat message to
+# change the target. If this value does not look like "owner/name" it is ignored and the
+# commit path refuses to run.
+_REPO_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,60}/[A-Za-z0-9_.\-]{1,80}$")
+if GITHUB_REPO and not _REPO_RE.match(GITHUB_REPO):
+    log.warning("GITHUB_REPO=%r is not owner/name - the commit path is disabled", GITHUB_REPO)
+    GITHUB_REPO = ""
+
+# Validate + compile, then stop. Nothing is written and nothing is committed.
+SELF_IMPROVE_DRY_RUN = (os.environ.get("SELF_IMPROVE_DRY_RUN", "false").strip().lower()
+                        in ("1", "true", "yes", "on"))
+# Modern credential: a GitHub App installation token (short-lived, per-repo) beats a
+# long-lived personal token. Used when these three are present; GITHUB_TOKEN is the
+# fallback. See README for the App setup.
+GITHUB_APP_ID = os.environ.get("GITHUB_APP_ID", "").strip()
+GITHUB_INSTALLATION_ID = os.environ.get("GITHUB_INSTALLATION_ID", "").strip()
+GITHUB_PRIVATE_KEY = (os.environ.get("GITHUB_PRIVATE_KEY", "") or "").replace("\\n", "\n")
+_GH_TOKEN_CACHE = {"token": "", "exp": 0.0}
+_IMP_FAILS = 0                 # circuit breaker: 3 bad commits and it stops for this run
 # Only these files may ever be touched. No .env, no secrets, no config of the host.
 IMPROVE_FILES = ("bot.py", "memory.py", "README.md", "env.example.txt")
 IMPROVE_MAX_LINES = int(os.environ.get("IMPROVE_MAX_LINES", "120") or "120")
@@ -10108,12 +10130,68 @@ _LESSONS_MAX = 400
 _PROPOSALS: dict = {}          # id -> {file, old, new, why, topic, ts}
 
 
+async def _github_token() -> str:
+    """A repo-scoped, short-lived installation token when a GitHub App is configured,
+    else the long-lived GITHUB_TOKEN. Never logged, never written anywhere."""
+    if GITHUB_APP_ID and GITHUB_INSTALLATION_ID and GITHUB_PRIVATE_KEY:
+        if _GH_TOKEN_CACHE["token"] and time.time() < _GH_TOKEN_CACHE["exp"] - 120:
+            return _GH_TOKEN_CACHE["token"]
+        try:
+            import jwt as _jwt          # optional dependency
+            now = int(time.time())
+            payload = {"iat": now - 60, "exp": now + 540, "iss": GITHUB_APP_ID}
+            tok = _jwt.encode(payload, GITHUB_PRIVATE_KEY, algorithm="RS256")
+            if isinstance(tok, bytes):
+                tok = tok.decode()
+            r = await HTTP.post(
+                f"https://api.github.com/app/installations/{GITHUB_INSTALLATION_ID}/"
+                f"access_tokens", headers={"Authorization": f"Bearer {tok}",
+                                          "Accept": "application/vnd.github+json",
+                                          "User-Agent": "AvenorSelfImprove/1.0"},
+                timeout=20)
+            if r.status_code == 201:
+                j = r.json() or {}
+                _GH_TOKEN_CACHE["token"] = j.get("token", "")
+                _GH_TOKEN_CACHE["exp"] = time.time() + 3000
+                log.info("github: using a GitHub App installation token (expires soon)")
+                return _GH_TOKEN_CACHE["token"]
+            log.warning("github app token failed (%s) - falling back to GITHUB_TOKEN",
+                        r.status_code)
+        except ImportError:
+            log.warning("PyJWT is not installed - cannot mint an App token; using "
+                        "GITHUB_TOKEN")
+        except Exception as e:  # noqa: BLE001
+            log.warning("github app token error: %s", str(e)[:120])
+    return GITHUB_TOKEN
+
+
+# Anything that looks like an identity is removed before a lesson is stored: the point of
+# a lesson is the PATTERN ("the model denied a capability"), never the person.
+_PII_RES = (
+    # email FIRST: the @username rule would otherwise eat "deepak@example.com" down to
+    # "deepak[id].com" and leave a recognisable local part behind.
+    re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]{2,}\b"),        # emails
+    re.compile(r"\b\d{6,12}\b"),                       # telegram ids, order numbers
+    re.compile(r"@[A-Za-z0-9_]{3,32}"),                  # @usernames
+    re.compile(r"\+?\d[\d\s\-]{8,}\d"),                # phone numbers
+)
+
+
+def _redact(text: str) -> str:
+    t = str(text or "")
+    for rx in _PII_RES:
+        t = rx.sub("[id]", t)
+    return t
+
+
 def _lesson(kind: str, detail: str, chat_id: int = 0) -> None:
     """Record one thing that went wrong. Silent, bounded, never raises."""
     try:
         row = {"ts": int(time.time()), "kind": str(kind)[:40],
-               "detail": re.sub(r"\s+", " ", str(detail or ""))[:300],
-               "chat": int(chat_id or 0)}
+               "detail": _redact(re.sub(r"\s+", " ", str(detail or "")))[:300]}
+        # NOTE: the chat id is deliberately NOT stored. A lesson is about the bot, not
+        # about who was talking to it - and a file of chat ids is exactly the kind of
+        # personal data that turns a bug list into a privacy problem.
         with open(_LESSONS_FILE, "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         if os.path.getsize(_LESSONS_FILE) > 300_000:      # keep the file small
@@ -10322,6 +10400,10 @@ async def _make_proposal(chat_id: int, topic: str) -> tuple:
 
 async def _apply_proposal(pid: str) -> tuple:
     """Apply an approved hunk: validate in a temp copy, then commit. Nothing partial."""
+    global _IMP_FAILS
+    if _IMP_FAILS >= 3:
+        return False, ("Self-improvement paused after 3 failed attempts. Restart the bot "
+                       "to try again.")
     prop = _PROPOSALS.get(pid)
     if not prop:
         return False, "That proposal has expired."
@@ -10351,16 +10433,27 @@ async def _apply_proposal(pid: str) -> tuple:
         except Exception as e:  # noqa: BLE001
             return False, f"Refused: could not compile the change ({str(e)[:120]})"
 
-    # 2) commit
-    if not GITHUB_TOKEN:
+    # 2) dry-run: everything above already ran, so this proves the change is sound
+    if SELF_IMPROVE_DRY_RUN:
+        _PROPOSALS.pop(pid, None)
+        return True, ("DRY RUN: the change validates and compiles. Nothing was written "
+                      "and nothing was committed.")
+
+    # 3) commit - only ever to GITHUB_REPO, only ever to a file on the allowlist
+    token = await _github_token()
+    if not token:
         with open(path, "w", encoding="utf-8") as f:
             f.write(updated)
         _PROPOSALS.pop(pid, None)
         return True, ("Applied to the local file only (no GITHUB_TOKEN set, so no "
                       "commit). Restart the bot to use it.")
     try:
+        if not GITHUB_REPO:
+            return False, "No GITHUB_REPO configured - nothing was committed."
         api = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{name}"
-        hdrs = {"Authorization": f"Bearer {GITHUB_TOKEN}",
+        if f"/repos/{GITHUB_REPO}/contents/" not in api or name not in IMPROVE_FILES:
+            return False, "Refused: the target is not the configured repo + allowlist."
+        hdrs = {"Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.github+json",
                 "User-Agent": "AvenorSelfImprove/1.0"}
         cur = await HTTP.get(api, params={"ref": GITHUB_BRANCH}, headers=hdrs, timeout=20)
@@ -10374,6 +10467,7 @@ async def _apply_proposal(pid: str) -> tuple:
             payload["sha"] = sha
         put = await HTTP.put(api, json=payload, headers=hdrs, timeout=30)
         if put.status_code not in (200, 201):
+            _IMP_FAILS += 1
             return False, f"GitHub commit failed ({put.status_code}) - nothing was committed."
         url = ((put.json() or {}).get("commit") or {}).get("html_url", "")
         with open(path, "w", encoding="utf-8") as f:
@@ -10381,6 +10475,7 @@ async def _apply_proposal(pid: str) -> tuple:
         _PROPOSALS.pop(pid, None)
         return True, f"Committed to {GITHUB_REPO}@{GITHUB_BRANCH}.\n{url}"
     except Exception as e:  # noqa: BLE001
+        _IMP_FAILS += 1
         return False, f"Commit failed ({str(e)[:150]}) - nothing was committed."
 
 
@@ -10421,7 +10516,13 @@ async def cmd_brain(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         return
     lines = ["🧠 *Brain*", "",
              f"Self-improvement: {'ON' if SELF_IMPROVE else 'off'}",
-             f"GitHub commit: {'ready' if GITHUB_TOKEN else 'no GITHUB_TOKEN (local only)'}",
+             f"Repo: {GITHUB_REPO or '(not set - commits disabled)'} @ {GITHUB_BRANCH}",
+             "Credential: " + ("GitHub App (short-lived)" if (GITHUB_APP_ID and
+                                GITHUB_PRIVATE_KEY) else
+                                ("personal token" if GITHUB_TOKEN else "none")),
+             f"Mode: {'DRY RUN (validates, never writes)' if SELF_IMPROVE_DRY_RUN else 'live'}",
+             "Can: edit one allowlisted file, one hunk, after your approval.",
+             "Cannot: create a repo, delete, rename, touch .env or another repo.",
              ]
     if not GITHUB_TOKEN:
         lines += [

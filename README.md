@@ -254,6 +254,23 @@ Delete, rename and new-file creation are refused outright. `/brain` shows the le
 has recorded about its own mistakes (a denied capability, a wrong skip, a promised file that
 was never attached, a provider outage) - recorded silently, never in the chat.
 
+**Which repository?** Exactly one, and it is not the model's choice. `GITHUB_REPO` is a
+single value you set in the environment; the code can only ever call
+`/repos/{GITHUB_REPO}/contents/{allowlisted file}`. There is no repository-creation call in
+the source, and no chat message can change the target. A value that is not `owner/name` is
+rejected at startup and the commit path switches itself off.
+
+**Credentials.** Prefer a **GitHub App** (`GITHUB_APP_ID`, `GITHUB_INSTALLATION_ID`,
+`GITHUB_PRIVATE_KEY`): it mints a token that expires in an hour and only reaches the one
+repository it is installed on. A fine-grained personal token with `Contents: Read and write`
+on that single repository also works (`GITHUB_TOKEN`). Use `SELF_IMPROVE_DRY_RUN=true` first:
+it validates and compiles the change and writes nothing.
+
+**What it learns.** Only de-identified failure patterns - "the model denied having web
+access", not who said what. IDs, @usernames, emails and phone numbers are replaced with
+`[id]` before a note is written, and the chat it came from is not recorded. That is why this
+is not a privacy problem: a lesson about the bot's own bug is not personal data.
+
 Set `SELF_IMPROVE=true` to turn any of this on. It is off by default.
 
 ## Group safety

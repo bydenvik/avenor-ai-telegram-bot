@@ -60,6 +60,12 @@ section 5), but nothing about it is written to storage.
 
 We do not sell your data, and we do not use your conversations to train AI models.
 
+When the bot gets something wrong it records a short, **de-identified** note about the
+failure - for example "the model denied having web access" - so the same mistake can be fixed.
+Before anything is stored, Telegram IDs, @usernames, email addresses and phone numbers are
+replaced with `[id]`, and the chat or user it came from is not recorded at all. These notes
+describe the bot's own behaviour, never a person, and they are never used to train a model.
+
 ## 5. Who else sees it (sub-processors)
 
 To generate a reply, the text of your message — and any image, voice note or document you send
