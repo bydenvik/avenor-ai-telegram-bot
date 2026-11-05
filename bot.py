@@ -8778,6 +8778,10 @@ DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 # (which this is) authenticates with the bot token alone. Those two are for HTTP
 # interactions, and asking for them only creates a variable that does nothing.
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
+if DISCORD_GUILD_ID and not DISCORD_GUILD_ID.isdigit():
+    log.warning("DISCORD_GUILD_ID=%r is not a numeric server id (enable Developer Mode, "
+                "right-click the server, Copy Server ID) - ignoring it", DISCORD_GUILD_ID)
+    DISCORD_GUILD_ID = ""
 DISCORD_ENABLED = bool(DISCORD_TOKEN)
 DISCORD_VC = os.environ.get("DISCORD_VC", "false").strip().lower() in ("1", "true", "yes", "on")
 DISCORD_ANSWER_IN_CHANNELS = os.environ.get("DISCORD_ANSWER_IN_CHANNELS", "true").strip().lower() \
@@ -8809,19 +8813,46 @@ def _discord_ctx(channel_name: str, guild_name: str) -> str:
               "under 1500 characters." + (f" {hint}" if hint else ""))
 
 
-async def _discord_answer(text: str, channel_name: str, guild_name: str) -> str:
-    """One answer, through the same model chain Telegram uses."""
+def _discord_chat_id(channel_id) -> int:
+    """A stable pseudo chat id for ONE Discord channel.
+
+    Every Discord message used to be sent as `chat_id 0`, so the transcript, the per-turn
+    model budget and the per-chat action limits were all bypassed and the bot forgot the
+    previous line. Negative keeps it out of Telegram's id space.
+    """
+    try:
+        return -(abs(int(channel_id)) % 10 ** 12)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _discord_answer(text: str, channel_name: str, guild_name: str,
+                          chat_id: int = 0, speaker: str = "someone") -> str:
+    """One answer, through the same model chain (and the same transcript) Telegram uses."""
     text = (text or "").strip()
     if not text:
         return ""
+    prompt = text[:2000]
+    ctx = _discord_ctx(channel_name, guild_name)
+    if chat_id:
+        # Same shape as the Telegram path: the recent transcript IS the prompt, so
+        # "what did I just ask you?" works on Discord too.
+        log_line(chat_id, speaker, text)
+        prompt = recent_chat_block(chat_id, speaker)
+        _turn_begin(chat_id)          # the per-message model budget Telegram already has
     try:
-        ans = await ask_gemini(0, text[:2000], _guard(_discord_ctx(channel_name, guild_name)))
+        ans = await ask_gemini(chat_id, prompt, _guard(ctx))
     except Exception as e:  # noqa: BLE001
         log.warning("discord: model call failed: %s", str(e)[:150])
         return "I could not reach the model just now - try again in a minute."
+    finally:
+        if chat_id:
+            _turn_end(chat_id)
     out = clean_reply(ans or "")
     if not out or out.strip() == BUSY_MSG:
         return "I am a little busy right now - try again in a minute."
+    if chat_id:
+        log_line(chat_id, "Avenor", out, 0)
     return out[:1900]
 
 
@@ -8856,9 +8887,18 @@ async def _discord_runner() -> None:
                      len(g.text_channels), len(g.voice_channels))
         try:
             if DISCORD_GUILD_ID:
-                tree.copy_global_to(guild=discord.Object(id=int(DISCORD_GUILD_ID)))
-            await tree.sync()
-            log.info("discord: slash commands synced")
+                # copy_global_to() only fills the guild's command list. sync() WITHOUT the
+                # guild argument pushes the GLOBAL list, which Discord may take an hour to
+                # show. Syncing to the guild makes the commands appear immediately.
+                _g = discord.Object(id=int(DISCORD_GUILD_ID))
+                tree.copy_global_to(guild=_g)
+                await tree.sync(guild=_g)
+                log.info("discord: slash commands synced to guild %s (instant)",
+                         DISCORD_GUILD_ID)
+            else:
+                await tree.sync()
+                log.info("discord: slash commands synced globally (Discord may take up to "
+                         "an hour - set DISCORD_GUILD_ID to skip the wait)")
         except Exception as e:  # noqa: BLE001
             log.warning("discord: slash sync failed (%s)", str(e)[:120])
 
@@ -8877,13 +8917,25 @@ async def _discord_runner() -> None:
                 return
             if not is_dm and not DISCORD_ANSWER_IN_CHANNELS:
                 return
-            text = message.content
+            text = message.content or ""
             if mentioned:
                 text = text.replace(f"<@{client.user.id}>", "").replace(
                     f"<@!{client.user.id}>", "").strip()
+            # An attachment-only message produced empty text and a silent drop, so the person
+            # saw nothing at all and assumed the bot was broken. Say so instead.
+            if not text.strip():
+                if message.attachments:
+                    await message.reply(
+                        "I can't open files or images on Discord yet - send them to me on "
+                        "Telegram and I'll read them there.",
+                        mention_author=False)
+                return
             guild_name = message.guild.name if message.guild else ""
+            _cid = _discord_chat_id(message.channel.id)
+            _speaker = getattr(message.author, "display_name", None) or "someone"
             async with message.channel.typing():
-                out = await _discord_answer(text, getattr(message.channel, "name", ""), guild_name)
+                out = await _discord_answer(text, getattr(message.channel, "name", ""),
+                                            guild_name, _cid, _speaker)
             if out:
                 for chunk in [out[i:i + 1900] for i in range(0, len(out), 1900)]:
                     await message.reply(chunk, mention_author=False)
@@ -8894,14 +8946,16 @@ async def _discord_runner() -> None:
     @tree.command(name="ask", description="Ask Avenor anything")
     async def _ask(interaction, prompt: str):  # noqa: ANN001, ANN202
         await interaction.response.defer(thinking=True)
-        out = await _discord_answer(prompt, getattr(interaction.channel, "name", ""),
-                                    interaction.guild.name if interaction.guild else "")
+        _ch = interaction.channel
+        out = await _discord_answer(
+            prompt, getattr(_ch, "name", ""),
+            interaction.guild.name if interaction.guild else "",
+            _discord_chat_id(getattr(_ch, "id", 0)),
+            getattr(interaction.user, "display_name", None) or "someone")
         await interaction.followup.send((out or "No answer.")[:1900])
 
     @tree.command(name="channels", description="List this server's channels and voice rooms")
     async def _channels(interaction):  # noqa: ANN001, ANN202
-        if not is_owner(type("U", (), {"id": 0})()):
-            pass
         lines = []
         for g in client.guilds:
             lines.append(f"**{g.name}** ({g.id})")
@@ -8916,6 +8970,22 @@ async def _discord_runner() -> None:
                 lines.append(f"  - #{ch.name} ({kind})")
         await interaction.response.send_message(
             ("\n".join(lines) or "I am not in any server yet.")[:1900], ephemeral=True)
+
+    @tree.error
+    async def _on_app_error(interaction, error):  # noqa: ANN001, ANN202
+        """Without this a failing slash command shows 'The application did not respond'."""
+        log.warning("discord: command failed (%s): %s",
+                    getattr(getattr(interaction, "command", None), "name", "?"),
+                    str(error)[:150])
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send("Something went wrong - try again.",
+                                                ephemeral=True)
+            else:
+                await interaction.response.send_message("Something went wrong - try again.",
+                                                        ephemeral=True)
+        except Exception as e:  # noqa: BLE001
+            log.debug("discord: could not report the command error (%s)", str(e)[:100])
 
     if DISCORD_VC:
         try:
@@ -8952,7 +9022,10 @@ async def _discord_runner() -> None:
                     if not audio:
                         await interaction.followup.send("Could not make the audio.")
                         return
-                    vc.play(discord.FFmpegPCMAudio(io.BytesIO(audio), pipe=True))
+                    # FFmpegPCMAudio defaults to "ffmpeg" on PATH, which a Render image does
+                    # not have; imageio-ffmpeg is already a dependency and ships one.
+                    vc.play(discord.FFmpegPCMAudio(io.BytesIO(audio), pipe=True,
+                                                  executable=_ffmpeg_exe() or "ffmpeg"))
                     await interaction.followup.send("Speaking.")
                 except Exception as e:  # noqa: BLE001
                     await interaction.followup.send(f"Voice failed: {str(e)[:150]}")
@@ -8962,6 +9035,17 @@ async def _discord_runner() -> None:
 
     try:
         await client.start(DISCORD_TOKEN)
+    except discord.PrivilegedIntentsRequired as e:
+        _DISCORD_STATE["last_error"] = ("MESSAGE CONTENT INTENT is off in the Discord "
+                                        "Developer Portal")
+        log.error("discord: gateway refused the connection (close code 4014). Enable "
+                  "MESSAGE CONTENT INTENT under Bot > Privileged Gateway Intents at "
+                  "discord.com/developers/applications, then redeploy. (%s)", str(e)[:100])
+    except discord.LoginFailure as e:
+        _DISCORD_STATE["last_error"] = "bad DISCORD_TOKEN"
+        log.error("discord: login failed - DISCORD_TOKEN must be the BOT token "
+                  "(Bot > Reset Token), not the Client Secret or the Public Key. (%s)",
+                  str(e)[:100])
     except Exception as e:  # noqa: BLE001
         _DISCORD_STATE["last_error"] = str(e)[:200]
         log.error("discord: client stopped (%s) - Telegram continues", str(e)[:150])
