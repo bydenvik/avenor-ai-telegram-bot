@@ -4487,6 +4487,55 @@ _HEALTH_SRV = None
 _READY = False          # flipped in _post_init once the bot can actually serve updates
 
 
+def _boot_report() -> dict:
+    """Everything needed to diagnose a failed boot, with NO secret values."""
+    import platform
+    pkgs = {}
+    for mod, name in (("telegram", "python-telegram-bot"), ("google.genai", "google-genai"),
+                      ("httpx", "httpx"), ("discord", "discord.py"), ("nacl", "PyNaCl"),
+                      ("dotenv", "python-dotenv")):
+        try:
+            m = __import__(mod, fromlist=["__version__"])
+            pkgs[name] = getattr(m, "__version__", "installed")
+        except Exception:  # noqa: BLE001
+            pkgs[name] = None
+    wanted = ("BOT_TOKEN", "GEMINI_API_KEY", "GROQ_API_KEY", "OWNER_IDS", "DISCORD_TOKEN",
+              "DISCORD_GUILD_ID", "GITHUB_TOKEN", "MEMORY_FILE", "PORT")
+    present = {k: bool(os.environ.get(k)) for k in wanted}
+    return {
+        "ok": True,
+        "ready": bool(_READY),
+        "python": platform.python_version(),
+        "packages": pkgs,
+        "env": present,
+        "models": len(GEMINI_MODELS),
+        "groq": bool(GROQ_API_KEY),
+        "discord": _discord_status_line(),
+        "memory_file": getattr(MEM, "MEMORY_FILE", "") if MEM is not None else "",
+        "uptime_s": int(time.time() - _BOOT_AT),
+        "last_error": _LAST_BOOT_ERROR,
+    }
+
+
+def _preflight() -> None:
+    """One block at the top of the log that says what is missing."""
+    r = _boot_report()
+    log.info("preflight: python %s | ready=%s", r["python"], r["ready"])
+    for name, ver in r["packages"].items():
+        if ver is None:
+            log.warning("preflight: %s is NOT installed", name)
+    missing = [k for k, v in r["env"].items() if not v]
+    log.info("preflight: env present=%s | missing=%s",
+             [k for k, v in r["env"].items() if v], missing)
+    if not r["env"].get("BOT_TOKEN"):
+        log.error("preflight: BOT_TOKEN is missing - the bot cannot start")
+    if not r["env"].get("GEMINI_API_KEY"):
+        log.error("preflight: GEMINI_API_KEY is missing - every reply will be 'busy'")
+    if not r["env"].get("OWNER_IDS"):
+        log.warning("preflight: OWNER_IDS is missing - owner commands will not work")
+    log.info("preflight: discord -> %s", r["discord"])
+
+
 def start_health_server() -> None:
     global _HEALTH_SRV
     port = int(os.environ.get("PORT", "0") or "0")
@@ -4513,7 +4562,22 @@ def start_health_server() -> None:
                 self.wfile.write(payload)
 
         def do_GET(self):
-            if self.path.rstrip("/") == "/ready" and not _READY:
+            path = self.path.rstrip("/")
+            if path == "/status":
+                # JSON, deliberately verbose: this is how a failed boot gets diagnosed
+                # without asking anyone to read the Render log.
+                try:
+                    body = json.dumps(_boot_report(), indent=1).encode()
+                except Exception as e:  # noqa: BLE001
+                    body = json.dumps({"ok": False, "error": str(e)[:200]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path == "/ready" and not _READY:
                 self._send(True, 503, _STARTING)
                 return
             self._send(True)
@@ -4536,7 +4600,7 @@ def start_health_server() -> None:
     srv.daemon_threads = True
     _HEALTH_SRV = srv
     threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("Health server up on port %s (/, /health)", port)
+    log.info("Health server up on port %s (/, /health, /status)", port)
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -8624,14 +8688,17 @@ async def _proactive_loop(bot) -> None:
 
 # ============================ PART 17e: DISCORD ============================
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
-DISCORD_APP_ID = os.environ.get("DISCORD_APPLICATION_ID", "").strip()
-DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY", "").strip()
+# DISCORD_APPLICATION_ID / DISCORD_PUBLIC_KEY are deliberately NOT read: a gateway bot
+# (which this is) authenticates with the bot token alone. Those two are for HTTP
+# interactions, and asking for them only creates a variable that does nothing.
 DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
 DISCORD_ENABLED = bool(DISCORD_TOKEN)
 DISCORD_VC = os.environ.get("DISCORD_VC", "false").strip().lower() in ("1", "true", "yes", "on")
 DISCORD_ANSWER_IN_CHANNELS = os.environ.get("DISCORD_ANSWER_IN_CHANNELS", "true").strip().lower() \
     in ("1", "true", "yes", "on")
 _DISCORD_STATE = {"ready": False, "guilds": 0, "channels": 0, "voice": 0, "last_error": ""}
+_BOOT_AT = time.time()
+_LAST_BOOT_ERROR = ""
 
 # A channel name can steer the answer without any extra setup: #research-lab searches,
 # #image-studio draws, everything else just talks.
@@ -8830,9 +8897,22 @@ async def _start_discord_if_configured() -> None:
     if not DISCORD_ENABLED:
         return
     try:
-        asyncio.create_task(_discord_runner())
+        task = asyncio.create_task(_discord_runner())
+        asyncio.create_task(_discord_watchdog(task))
     except Exception as e:  # noqa: BLE001
         log.warning("discord: could not start (%s)", str(e)[:120])
+
+
+async def _discord_watchdog(task) -> None:  # noqa: ANN001
+    """A Discord problem must never hold the process up: 60s, then cancel and say why."""
+    await asyncio.sleep(60)
+    if task.done():
+        return
+    if not _DISCORD_STATE["ready"]:
+        _DISCORD_STATE["last_error"] = _DISCORD_STATE["last_error"] or "not connected in 60s"
+        log.error("discord: not connected after 60s (%s) - cancelling it. Telegram is "
+                  "unaffected.", _DISCORD_STATE["last_error"])
+        task.cancel()
 
 
 async def _post_init(app) -> None:
@@ -10774,6 +10854,10 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001
             log.debug("memory path check failed: %s", e)
 
+    try:
+        _preflight()
+    except Exception as e:  # noqa: BLE001
+        log.warning("preflight failed: %s", str(e)[:120])
     start_health_server()
     _load_members()
     log.info("welcome image present: %s (%s) - optional", os.path.exists(WELCOME_IMAGE),

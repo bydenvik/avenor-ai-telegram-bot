@@ -85,13 +85,32 @@ working default.
 
 ## Configuration
 
+**Three variables are required. Nothing else has to be set.**
+
 | Variable | What to put |
 |---|---|
 | `BOT_TOKEN` | Token from [@BotFather](https://t.me/BotFather) |
-| `GEMINI_API_KEY` | Free key from Google AI Studio |
-| `OWNER_IDS` | Your Telegram ID — `/id` gives it to you |
-| `GROQ_API_KEY` | Optional but recommended: a second provider when Gemini is rate-limited |
-| `GITHUB_TOKEN` | Only for self-improvement commits (fine-grained, one repo, Contents: write) |
+| `GEMINI_API_KEY` | Free key from [Google AI Studio](https://aistudio.google.com/app/apikey) |
+| `OWNER_IDS` | Your Telegram ID — send `/id` to the bot |
+
+Optional, only if you use that feature:
+
+| Variable | What it enables |
+|---|---|
+| `GROQ_API_KEY` | Second provider when Gemini is rate-limited (also transcribes voice notes) |
+| `DISCORD_TOKEN` | The Discord half of the bot |
+| `GITHUB_TOKEN` | `/improve` commits (fine-grained, one repo, Contents: write) |
+
+Everything else — model chain, effort budgets, spam thresholds, memory limits, Discord
+behaviour — has a working default in the code. Setting a variable is how you *change* a
+default, never how you make the bot run.
+
+**Is it running?** Open `https://<your-service>.onrender.com/status`. It returns JSON with the
+Python version, every package version, which env vars are present (names only), the Discord
+state and the last error. `/` and `/health` stay 2 bytes for keep-alive pings.
+
+`render.yaml` in the repo sets the build command, start command, health check and the variable
+list, so a Blueprint deploy needs no manual configuration.
 
 The full list — model chain, effort budgets, voice, group behaviour, memory limits — is in
 [`.env.example`](.env.example) with a note on every line.
@@ -231,7 +250,8 @@ avenor-ai-telegram-bot/
 |---|---|
 | "Avenor is a little busy" | every provider is rate-limited — run `/diag`, check quotas, add `GROQ_API_KEY` |
 | `/improve` says the feature is off | no GitHub credential, or `SELF_IMPROVE=false` — `/brain` says which |
-| Discord silent | `DISCORD_TOKEN` missing, `discord.py` not installed, or the bot was invited without the `bot` + `applications.commands` scopes |
+| Discord silent | `DISCORD_TOKEN` missing, `discord.py` not installed, `MESSAGE CONTENT INTENT` off in the Developer Portal, or invited without the `bot` + `applications.commands` scopes |
+| Bot does not start | open `/status` — it lists the Python version, missing packages and missing env vars |
 | A model shows ❌ in `/diag` | 404/500 on Google's side — paste the `GEMINI_MODELS=` line it prints |
 | Files not arriving | `MAX_FILE_BYTES`, or the person is over the daily action cap |
 | Voice replies silent | `ffmpeg` missing on the host |
