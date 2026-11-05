@@ -198,7 +198,7 @@ avenor-ai-telegram-bot/
 ├── .env.example        Environment template (a template — the bot reads the real environment)
 ├── privacy-policy.md   What is stored and what leaves the server
 ├── .gitignore          Must be named exactly ".gitignore", or git reads none of it
-├── LICENSE.txt         MIT
+├── LICENSE             MIT
 └── README.md
 ```
 

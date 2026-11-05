@@ -9979,6 +9979,36 @@ _EXCERPT_STOP = {"that", "this", "with", "from", "have", "will", "been", "they",
                  "were", "and", "the", "for", "not", "but", "can", "you", "are", "its"}
 
 
+def _symbol_map(src: str, topic: str = "", limit: int = 420) -> str:
+    """The file's targets, FUNCTIONS FIRST.
+
+    The first version listed constants in file order and hit its cap around line 220, so the
+    model never saw a single function - which is the only thing it can usefully patch.
+    """
+    funcs, consts = [], []
+    for i, ln in enumerate(src.splitlines(), 1):
+        m = re.match(r"^(?:async\s+)?def\s+([A-Za-z_]\w*)", ln)
+        if m:
+            funcs.append((i, m.group(1)))
+            continue
+        m = re.match(r"^([A-Z][A-Z0-9_]{2,})\s*=", ln)
+        if m:
+            consts.append((i, m.group(1)))
+    keys = [w.lower() for w in re.findall(r"[A-Za-z_]\w{2,}", topic or "")]
+    hot = [(i, n) for i, n in funcs + consts if any(k in n.lower() for k in keys)]
+    out = []
+    if hot:
+        out.append("LIKELY TARGETS (matched the topic):")
+        out += [f"{i}: {n}" for i, n in hot[:20]]
+        out.append("")
+    out.append("FUNCTIONS:")
+    out += [f"{i}: def {n}" for i, n in funcs[:max(60, limit - len(hot) - 60)]]
+    out.append("")
+    out.append("CONSTANTS:")
+    out += [f"{i}: {n}" for i, n in consts[:60]]
+    return "\n".join(out)
+
+
 def _excerpt_for(src: str, topic: str, lessons: list, limit: int = 30000) -> str:
     """The parts of the file worth showing: around the words in the topic/lessons.
 
@@ -10051,6 +10081,17 @@ async def _make_proposal(chat_id: int, topic: str) -> tuple:
         return False, ("Self-improvement is off. Set SELF_IMPROVE=true and restart "
                        "(it stays owner-only and approval-gated).")
     lessons = _recent_lessons(8)
+    if not (topic or "").strip() and not lessons:
+        # Nothing to fix and nothing asked for. Calling the model here only produced
+        # "The model found no safe change to propose." three times in a row.
+        return False, ("Nothing to change yet: I have not recorded a failure, and you did "
+                       "not name a topic.\n\n"
+                       "Name what you want changed, for example:\n"
+                       "• /improve BUSY_MSG  — the busy message\n"
+                       "• /improve _progress_text  — the working bubble\n"
+                       "• /improve _spam_score  — spam scoring\n"
+                       "• /improve youtube  — YouTube lookups\n\n"
+                       "A function or constant name works far better than a sentence.")
     evidence = "\n".join(f"- [{r.get('kind')}] {r.get('detail')}" for r in lessons) or "- (none)"
     target = "bot.py"
     try:
@@ -10063,6 +10104,8 @@ async def _make_proposal(chat_id: int, topic: str) -> tuple:
         "Propose ONE small, surgical code change to this Telegram bot.\n"
         f"Topic: {topic or 'the most recent failures'}\n\n"
         f"Recent recorded failures:\n{evidence}\n\n"
+        "Top-level symbols in this file (line: name) - pick your target from here:\n"
+        f"{_symbol_map(src, topic)}\n\n"
         "Reply in EXACTLY this format and nothing else:\n"
         "FILE: bot.py\n"
         "WHY: <one line>\n"
@@ -10070,15 +10113,23 @@ async def _make_proposal(chat_id: int, topic: str) -> tuple:
         "NEW:\n<<<\n<the replacement lines>\n>>>\n\n"
         "Rules: the OLD block must be copied character-for-character from the file so it "
         "matches exactly once; keep it under 40 lines; no subprocess/eval/exec; no secrets; "
-        "no new files, no renames, no deletions. If you cannot find a safe small change, "
-        "reply with exactly: NOCHANGE",
+        "no new files, no renames, no deletions. A one-line change is a good change. "
+        "Only reply NOCHANGE if the file already does exactly what the topic asks.",
         _guard("=== SOURCE EXCERPT (line numbers on the left) ===\n"
                + _excerpt_for(src, topic, lessons)))
-    if not ask or ask.strip().upper().startswith("NOCHANGE"):
-        return False, "The model found no safe change to propose."
+    if not ask:
+        return False, ("The model returned nothing - every provider is probably rate-"
+                       "limited. Try again in a minute, or run /diag.")
+    if ask.strip().upper().startswith("NOCHANGE"):
+        return False, ("The model read the code and said no change was needed.\n\n"
+                       f"What it was asked to change: {topic or '(the recorded failures)'}\n\n"
+                       "That usually means the topic did not name anything specific. Try:\n"
+                       "• /improve BUSY_MSG\n• /improve _progress_text\n"
+                       "• /improve _spam_score")
     m = _PATCH_RE.search(ask)
     if not m:
-        return False, "The model's reply was not in the patch format - nothing was changed."
+        return False, ("The model answered, but not as a patch - nothing was changed.\n\n"
+                       "What it said:\n" + (ask or "").strip()[:400])
     name, why, old, new = m.group(1).strip(), m.group(2).strip(), m.group(3), m.group(4)
     problem = _safe_hunk(name, old, new)
     if problem:
@@ -10220,7 +10271,13 @@ async def cmd_improve(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     topic = " ".join(c.args).strip() if c.args else ""
-    msg = await u.message.reply_text("🧠 Reviewing recent failures and writing a proposal…")
+    try:
+        _n = len(open(os.path.join(_HERE, "bot.py"), encoding="utf-8").read().splitlines())
+    except Exception:  # noqa: BLE001
+        _n = 0
+    msg = await u.message.reply_text(
+        f"🧠 Looking for: {topic or 'the failures I recorded'}\n"
+        f"File: bot.py ({_n} lines). Reading the relevant part, then writing one hunk…")
     ok, out = await _make_proposal(u.effective_chat.id, topic)
     if not ok:
         await msg.edit_text("Nothing to apply.\n\n" + out)
