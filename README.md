@@ -52,6 +52,7 @@ scan, and an SSRF guard on every outbound fetch.
 | Telegram | python-telegram-bot 22.8 |
 | AI | `google-genai` — Gemini chain, Groq fallback, Pollinations last resort |
 | Storage | One JSON file, debounced atomic writes |
+| Discord | discord.py 2.4 (optional, same process) |
 | Hosting | Render, Docker, or any VPS |
 
 | File | What lives there |
@@ -114,6 +115,26 @@ paste once you have pruned the dead ones.
 `/help` shows each role only the commands it can use, so a member never sees a list they cannot run.
 
 ---
+
+## Discord
+
+The same assistant runs on Discord from the same process, as a separate task: if discord.py is
+missing or the token is wrong, the Telegram bot is unaffected.
+
+- Answers a **DM**, an **@mention**, or **/ask** in a channel. Plain channel chatter is ignored.
+- `/channels` lists every server, category, text channel and voice channel the bot can see.
+- `/join` + `/speak` make it join your voice channel and say something — set `DISCORD_VC=true`
+  and install `PyNaCl` for that.
+
+| Variable | What it is |
+|---|---|
+| `DISCORD_TOKEN` | Bot token from the Developer Portal → Bot → Reset Token |
+| `DISCORD_GUILD_ID` | The server to sync slash commands to (instant, instead of global) |
+| `DISCORD_ANSWER_IN_CHANNELS` | `true` (default) answers @mentions in channels |
+| `DISCORD_VC` | `true` enables `/join` and `/speak` |
+
+`DISCORD_APPLICATION_ID` and `DISCORD_PUBLIC_KEY` are **not** needed for a gateway bot — those
+are for HTTP interactions. Only the bot token is required.
 
 ## Effort routing
 
@@ -210,6 +231,7 @@ avenor-ai-telegram-bot/
 |---|---|
 | "Avenor is a little busy" | every provider is rate-limited — run `/diag`, check quotas, add `GROQ_API_KEY` |
 | `/improve` says the feature is off | no GitHub credential, or `SELF_IMPROVE=false` — `/brain` says which |
+| Discord silent | `DISCORD_TOKEN` missing, `discord.py` not installed, or the bot was invited without the `bot` + `applications.commands` scopes |
 | A model shows ❌ in `/diag` | 404/500 on Google's side — paste the `GEMINI_MODELS=` line it prints |
 | Files not arriving | `MAX_FILE_BYTES`, or the person is over the daily action cap |
 | Voice replies silent | `ffmpeg` missing on the host |

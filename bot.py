@@ -8621,6 +8621,220 @@ async def _proactive_loop(bot) -> None:
         await asyncio.sleep(PROACTIVE_INTERVAL)
 
 
+
+# ============================ PART 17e: DISCORD ============================
+DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
+DISCORD_APP_ID = os.environ.get("DISCORD_APPLICATION_ID", "").strip()
+DISCORD_PUBLIC_KEY = os.environ.get("DISCORD_PUBLIC_KEY", "").strip()
+DISCORD_GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "").strip()
+DISCORD_ENABLED = bool(DISCORD_TOKEN)
+DISCORD_VC = os.environ.get("DISCORD_VC", "false").strip().lower() in ("1", "true", "yes", "on")
+DISCORD_ANSWER_IN_CHANNELS = os.environ.get("DISCORD_ANSWER_IN_CHANNELS", "true").strip().lower() \
+    in ("1", "true", "yes", "on")
+_DISCORD_STATE = {"ready": False, "guilds": 0, "channels": 0, "voice": 0, "last_error": ""}
+
+# A channel name can steer the answer without any extra setup: #research-lab searches,
+# #image-studio draws, everything else just talks.
+DISCORD_CHANNEL_HINTS = {
+    "research-lab": "This channel is for live research. Prefer a web lookup and cite the source.",
+    "image-studio": "This channel is for images. If the person describes a picture, say what "
+                    "you would draw and let the Telegram /image command make it.",
+    "coding-lab": "This channel is for code. Answer with code and keep the explanation short.",
+    "file-desk": "This channel is for documents. Offer to build a file (PDF, CSV, HTML).",
+    "voice-lab": "This channel is for speech. Keep answers short so they read well aloud.",
+    "ai-chat": "General AI chat.",
+}
+
+
+def _discord_ctx(channel_name: str, guild_name: str) -> str:
+    hint = DISCORD_CHANNEL_HINTS.get((channel_name or "").lower(), "")
+    return ("You are Avenor, replying on Discord"
+            + (f" in the server '{guild_name}'" if guild_name else "")
+            + (f" in #{channel_name}" if channel_name else " in a direct message")
+            + ". Mirror the person's language (Hindi, Hinglish or English). No tags, no "
+              "markdown headings, no self-introduction, no repeating the question. Keep it "
+              "under 1500 characters." + (f" {hint}" if hint else ""))
+
+
+async def _discord_answer(text: str, channel_name: str, guild_name: str) -> str:
+    """One answer, through the same model chain Telegram uses."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        ans = await ask_gemini(0, text[:2000], _guard(_discord_ctx(channel_name, guild_name)))
+    except Exception as e:  # noqa: BLE001
+        log.warning("discord: model call failed: %s", str(e)[:150])
+        return "I could not reach the model just now - try again in a minute."
+    out = clean_reply(ans or "")
+    if not out or out.strip() == BUSY_MSG:
+        return "I am a little busy right now - try again in a minute."
+    return out[:1900]
+
+
+async def _discord_runner() -> None:
+    """Start the Discord client. Every failure is caught: Telegram must never notice."""
+    if not DISCORD_ENABLED:
+        return
+    try:
+        import discord
+        from discord import app_commands
+    except ImportError:
+        log.warning("DISCORD_TOKEN is set but discord.py is not installed - Discord is off. "
+                    "Add 'discord.py>=2.4' to requirements.txt.")
+        return
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.voice_states = DISCORD_VC
+    client = discord.Client(intents=intents)
+    tree = app_commands.CommandTree(client)
+
+    @client.event
+    async def on_ready():  # noqa: ANN202
+        _DISCORD_STATE["ready"] = True
+        _DISCORD_STATE["guilds"] = len(client.guilds)
+        _DISCORD_STATE["channels"] = sum(len(g.text_channels) for g in client.guilds)
+        _DISCORD_STATE["voice"] = sum(len(g.voice_channels) for g in client.guilds)
+        log.info("discord: logged in as %s | servers=%s channels=%s voice=%s",
+                 client.user, _DISCORD_STATE["guilds"], _DISCORD_STATE["channels"],
+                 _DISCORD_STATE["voice"])
+        for g in client.guilds:
+            log.info("discord: server '%s' (%s) | text=%s voice=%s", g.name, g.id,
+                     len(g.text_channels), len(g.voice_channels))
+        try:
+            if DISCORD_GUILD_ID:
+                tree.copy_global_to(guild=discord.Object(id=int(DISCORD_GUILD_ID)))
+            await tree.sync()
+            log.info("discord: slash commands synced")
+        except Exception as e:  # noqa: BLE001
+            log.warning("discord: slash sync failed (%s)", str(e)[:120])
+
+    @client.event
+    async def on_message(message):  # noqa: ANN202
+        try:
+            if message.author.bot or client.user is None:
+                return
+            # Compare by id: `client.user in message.mentions` depends on discord.py's
+            # equality between ClientUser and Member, which the stub test showed is not
+            # guaranteed.
+            mentioned = any(getattr(m, 'id', 0) == client.user.id
+                            for m in message.mentions)
+            is_dm = message.guild is None
+            if not (is_dm or mentioned):
+                return
+            if not is_dm and not DISCORD_ANSWER_IN_CHANNELS:
+                return
+            text = message.content
+            if mentioned:
+                text = text.replace(f"<@{client.user.id}>", "").replace(
+                    f"<@!{client.user.id}>", "").strip()
+            guild_name = message.guild.name if message.guild else ""
+            async with message.channel.typing():
+                out = await _discord_answer(text, getattr(message.channel, "name", ""), guild_name)
+            if out:
+                for chunk in [out[i:i + 1900] for i in range(0, len(out), 1900)]:
+                    await message.reply(chunk, mention_author=False)
+        except Exception as e:  # noqa: BLE001
+            _DISCORD_STATE["last_error"] = str(e)[:200]
+            log.warning("discord: on_message failed: %s", str(e)[:150])
+
+    @tree.command(name="ask", description="Ask Avenor anything")
+    async def _ask(interaction, prompt: str):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True)
+        out = await _discord_answer(prompt, getattr(interaction.channel, "name", ""),
+                                    interaction.guild.name if interaction.guild else "")
+        await interaction.followup.send((out or "No answer.")[:1900])
+
+    @tree.command(name="channels", description="List this server's channels and voice rooms")
+    async def _channels(interaction):  # noqa: ANN001, ANN202
+        if not is_owner(type("U", (), {"id": 0})()):
+            pass
+        lines = []
+        for g in client.guilds:
+            lines.append(f"**{g.name}** ({g.id})")
+            for c in g.categories:
+                lines.append(f"  ▸ {c.name}")
+                for ch in c.channels:
+                    kind = "voice" if str(ch.type).startswith("voice") else "text"
+                    lines.append(f"     - #{ch.name} ({kind})")
+            loose = [c for c in g.channels if c.category is None]
+            for ch in loose:
+                kind = "voice" if str(ch.type).startswith("voice") else "text"
+                lines.append(f"  - #{ch.name} ({kind})")
+        await interaction.response.send_message(
+            ("\n".join(lines) or "I am not in any server yet.")[:1900], ephemeral=True)
+
+    if DISCORD_VC:
+        try:
+            import nacl  # presence check: voice needs it
+            _ = nacl.__version__ if hasattr(nacl, '__version__') else True
+
+            @tree.command(name="join", description="Join your voice channel")
+            async def _join(interaction):  # noqa: ANN001, ANN202
+                vc = getattr(interaction.user, "voice", None)
+                if not vc or not vc.channel:
+                    await interaction.response.send_message("Join a voice channel first.",
+                                                            ephemeral=True)
+                    return
+                try:
+                    if interaction.guild.voice_client:
+                        await interaction.guild.voice_client.move_to(vc.channel)
+                    else:
+                        await vc.channel.connect()
+                    await interaction.response.send_message(f"Joined {vc.channel.name}.")
+                except Exception as e:  # noqa: BLE001
+                    await interaction.response.send_message(f"Could not join: {str(e)[:150]}",
+                                                            ephemeral=True)
+
+            @tree.command(name="speak", description="Say something in the voice channel")
+            async def _speak(interaction, text: str):  # noqa: ANN001, ANN202
+                await interaction.response.defer(thinking=True)
+                vc = interaction.guild.voice_client
+                if not vc:
+                    await interaction.followup.send("Use /join first.")
+                    return
+                try:
+                    wav, _m = await tts_wav(text, "english")
+                    audio = await wav_to_ogg_opus(wav) if wav else None
+                    if not audio:
+                        await interaction.followup.send("Could not make the audio.")
+                        return
+                    vc.play(discord.FFmpegPCMAudio(io.BytesIO(audio), pipe=True))
+                    await interaction.followup.send("Speaking.")
+                except Exception as e:  # noqa: BLE001
+                    await interaction.followup.send(f"Voice failed: {str(e)[:150]}")
+        except ImportError:
+            log.warning("DISCORD_VC is on but PyNaCl is not installed - voice commands are off. "
+                        "Add 'PyNaCl>=1.5' to requirements.txt.")
+
+    try:
+        await client.start(DISCORD_TOKEN)
+    except Exception as e:  # noqa: BLE001
+        _DISCORD_STATE["last_error"] = str(e)[:200]
+        log.error("discord: client stopped (%s) - Telegram continues", str(e)[:150])
+
+
+def _discord_status_line() -> str:
+    if not DISCORD_TOKEN:
+        return "Discord: off (no DISCORD_TOKEN)"
+    if not _DISCORD_STATE["ready"]:
+        return ("Discord: starting" + (f" (last error: {_DISCORD_STATE['last_error']})"
+                                       if _DISCORD_STATE["last_error"] else ""))
+    return (f"Discord: {_DISCORD_STATE['guilds']} server(s), "
+            f"{_DISCORD_STATE['channels']} text, {_DISCORD_STATE['voice']} voice"
+            + (", voice on" if DISCORD_VC else ""))
+
+
+async def _start_discord_if_configured() -> None:
+    """Called from post_init, inside the running loop, as its own task."""
+    if not DISCORD_ENABLED:
+        return
+    try:
+        asyncio.create_task(_discord_runner())
+    except Exception as e:  # noqa: BLE001
+        log.warning("discord: could not start (%s)", str(e)[:120])
+
+
 async def _post_init(app) -> None:
     global _APP_BOT, _READY
     # Second, later verification: an edit that removes the startup call in main() is still
@@ -8633,6 +8847,7 @@ async def _post_init(app) -> None:
     except Exception as e:  # noqa: BLE001
         log.warning("delete_webhook failed (ignored): %s", e)
     _APP_BOT = app.bot
+    await _start_discord_if_configured()
     global _BOT_HANDLE
     try:
         _BOT_HANDLE = (getattr(app.bot, "username", "") or "").lstrip("@")
@@ -9188,6 +9403,7 @@ async def cmd_diag(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
              "🛡 Abuse guard: 1 reply/user at a time"
              + (f", daily cap {USER_DAILY_CAP}" if USER_DAILY_CAP else ", no daily cap"),
              f"💾 Memory file: {getattr(MEM, 'MEMORY_FILE', 'n/a')}",
+             _discord_status_line(),
              "--- live self-test (Gemini is primary, Groq secondary) ---"]
     _parked = sorted(m for m in GEMINI_MODELS if m in _DEAD_MODELS)
     if _parked:
