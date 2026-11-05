@@ -3,9 +3,9 @@ google-genai>=2.25
 httpx>=0.27
 python-dotenv>=1.0
 # Discord support (leave it in: it is only imported when DISCORD_TOKEN is set)
-discord.py>=2.4
+discord.py>=1.5
 # Voice channels in Discord need this
-# PyNaCl>=1.5
+# PyNaCl>=2.4
 tzdata
 imageio-ffmpeg>=0.4.9
 # Optional: syntax-checks generated .yaml files before they are sent
