@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: avenor-ai
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      # --- required (3) ---
+      - key: BOT_TOKEN
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: OWNER_IDS
+        sync: false
+      # --- optional, leave empty if you do not use them ---
+      - key: GROQ_API_KEY
+        sync: false
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
