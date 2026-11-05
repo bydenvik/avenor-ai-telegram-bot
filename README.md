@@ -8,7 +8,7 @@ change. One Python file, one JSON store, no database to run.
 - **Group:** [Avenor AI Community](https://t.me/AvenorAICommunity)
 - **Repository:** [github.com/bydenvik/avenor-ai-telegram-bot](https://github.com/bydenvik/avenor-ai-telegram-bot)
 - **Developer:** [bydenvik](https://github.com/bydenvik)
-- **Licence:** MIT — see [LICENSE.txt](LICENSE.txt)
+- **Licence:** MIT — see [LICENSE](LICENSE)
 
 ---
 
@@ -218,7 +218,7 @@ avenor-ai-telegram-bot/
 
 ## Licence
 
-MIT. Keep the copyright notice. See [LICENSE.txt](LICENSE.txt).
+MIT. Keep the copyright notice. See [LICENSE](LICENSE).
 
 ---
 
