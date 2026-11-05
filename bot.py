@@ -332,7 +332,14 @@ def _turn_begin(chat_id) -> None:
     """Open a fresh budget for one incoming message."""
     global _TURN_ID
     _TURN_ID += 1                     # this message is a NEW request
-    _TURN[chat_id] = [0, time.monotonic() + TURN_BUDGET]
+    _TURN[chat_id] = [0, time.monotonic() + TURN_BUDGET, _TURN_ID]
+
+
+def _turn_id(chat_id) -> int:
+    """The turn id of THIS chat. A global id let one chat's new message invalidate an
+    action another chat had already been granted."""
+    st = _TURN.get(chat_id)
+    return int(st[2]) if st and len(st) > 2 else _TURN_ID
 
 
 def _turn_allows(chat_id) -> bool:
@@ -2597,14 +2604,17 @@ def _strip_file_leadin(text: str) -> str:
     t = _FILE_LEADIN_RE.sub("", t)
     # a line that ends with a colon and has nothing after it is a lead-in to nothing
     lines = t.split("\n")
-    out = []
-    for i, ln in enumerate(lines):
-        stripped = ln.strip()
-        rest = " ".join(x.strip() for x in lines[i + 1:] if x.strip())
-        if stripped.endswith((":", "：")) and not rest:
-            continue
-        out.append(ln)
-    t = "\n".join(out)
+    # One backward pass instead of rebuilding the tail for every line (that was O(n^2) and
+    # blocked the event loop for seconds on a long generated file).
+    keep = [True] * len(lines)
+    has_after = False
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if stripped.endswith((":", "：")) and not has_after:
+            keep[i] = False
+        if stripped:
+            has_after = True
+    t = "\n".join(ln for i, ln in enumerate(lines) if keep[i])
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
@@ -3109,7 +3119,7 @@ def action_allowed(chat_id: int, kind: str) -> bool:
     key = (chat_id, kind)
     # Already granted for THIS message? Then yes, and do not charge twice - the same turn
     # legitimately asks several times while it decides how to deliver the answer.
-    if _ACTION_TURN.get(key) == _TURN_ID:
+    if _ACTION_TURN.get(key) == _turn_id(chat_id):
         return True
     now = time.time()
     if now - _ACTION_LAST.get((chat_id, kind), 0.0) < cool:
@@ -3122,7 +3132,7 @@ def action_allowed(chat_id: int, kind: str) -> bool:
         return False
     _ACTION_DAY[(chat_id, kind)] = (d, n + 1)
     _ACTION_LAST[(chat_id, kind)] = now
-    _ACTION_TURN[key] = _TURN_ID
+    _ACTION_TURN[key] = _turn_id(chat_id)
     return True
 
 
@@ -3251,6 +3261,23 @@ async def send_made_file(bot, chat_id: int, name: str, content: str) -> bool:
 
 _VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
               "param", "source", "track", "wbr"}
+# HTML5 lets these end tags be omitted, and a model writing a page uses that constantly
+# ("<li>a<li>b", "<p>one<p>two", "<td>a<td>b"). Reporting them as unclosed rejected valid
+# pages and burned two repair calls on every generated HTML file.
+_OPTIONAL_END = {"p", "li", "td", "th", "tr", "option", "dt", "dd", "thead", "tbody",
+                 "tfoot", "colgroup", "optgroup", "rt", "rp"}
+_AUTO_CLOSED_BY = {
+    "li": {"li"}, "p": {"p"}, "td": {"td", "th"}, "th": {"td", "th"},
+    "tr": {"tr", "td", "th"}, "option": {"option"}, "dt": {"dt", "dd"},
+    "dd": {"dt", "dd"}, "tbody": {"thead", "tbody", "tfoot"}, "thead": {"tbody", "tfoot"},
+    "tfoot": {"tbody"},
+}
+_IMPLICIT_CLOSERS = {
+    "ul": {"li"}, "ol": {"li"}, "dl": {"dt", "dd"}, "select": {"option", "optgroup"},
+    "table": {"tr", "td", "th", "thead", "tbody", "tfoot"}, "tr": {"td", "th"},
+    "thead": {"tr", "td", "th"}, "tbody": {"tr", "td", "th"},
+    "tfoot": {"tr", "td", "th"}, "div": {"p"}, "section": {"p"}, "body": {"p"},
+}
 
 
 def _balanced(text: str, pairs="{}[]()") -> str:
@@ -3299,12 +3326,25 @@ def _check_html(text: str) -> str:
             self.problem = ""
 
         def handle_starttag(self, tag, attrs):
-            if tag not in _VOID_TAGS:
-                self.stack.append((tag, self.getpos()[0]))
+            if tag in _VOID_TAGS:
+                return
+            while self.stack and self.stack[-1][0] in _AUTO_CLOSED_BY.get(tag, ()):
+                self.stack.pop()
+            self.stack.append((tag, self.getpos()[0]))
 
         def handle_endtag(self, tag):
             if tag in _VOID_TAGS:
                 return
+            if not self.stack:
+                self.problem = self.problem or f"</{tag}> closes nothing (line {self.getpos()[0]})"
+                return
+            while self.stack and self.stack[-1][0] in _IMPLICIT_CLOSERS.get(tag, ()):
+                self.stack.pop()
+            if self.stack and self.stack[-1][0] != tag and tag in _OPTIONAL_END:
+                for _i in range(len(self.stack) - 1, -1, -1):
+                    if self.stack[_i][0] == tag:
+                        del self.stack[_i:]
+                        return
             if not self.stack:
                 self.problem = self.problem or f"</{tag}> closes nothing (line {self.getpos()[0]})"
                 return
@@ -3322,8 +3362,9 @@ def _check_html(text: str) -> str:
         return f"HTML does not parse: {str(e)[:120]}"
     if c.problem:
         return c.problem
-    if c.stack:
-        tag, line = c.stack[-1]
+    leftover = [(t, ln) for (t, ln) in c.stack if t not in _OPTIONAL_END]
+    if leftover:
+        tag, line = leftover[-1]
         return f"<{tag}> opened on line {line} is never closed"
     return ""
 
@@ -3897,9 +3938,9 @@ def _attribution_line(name: str) -> str:
     if ext == "sql":
         return f"-- {tag}\n"
     if ext in ("py", "sh", "yaml", "yml", "toml", "ini", "cfg"):
-        return f"# {tag}\\n"
+        return f"# {tag}\n"
     if ext in ("js", "css", "ts", "json5"):
-        return f"/* {tag} */\\n"
+        return f"/* {tag} */\n"
     if ext in ("html", "htm", "xml", "svg"):
         return f"<!-- {tag} -->\\n"
     if ext == "json":
@@ -4416,6 +4457,11 @@ async def ask_gemini_stream(chat_id, prompt_text: str, context: str,
         if not order:
             return None
         smodel = order[0]
+        # gemma has no system_instruction support, so _gen_config drops it; the non-streaming
+        # path folds it into the first user turn with _gemma_contents. Streaming did not,
+        # so on a gemma turn the persona, rules and live context vanished entirely.
+        if _is_gemma(smodel):
+            contents = _gemma_contents(contents, sys_instr)
         stream = await client.aio.models.generate_content_stream(
             model=smodel, contents=contents,
             config=_gen_config(sys_instr, smodel, True, _level, _tokens),
@@ -4723,7 +4769,7 @@ async def cmd_skills(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
     code and costs no model call."""
     body = _capabilities_text()
     for chunk in split_text(body):
-        await _send_plain(c.bot, u.effective_chat.id, md_to_html(chunk))
+        await _safe_send(u, c, md_to_html(chunk), chunk)
 
 
 async def cmd_help(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5064,7 +5110,10 @@ async def cmd_forget(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
             # a same-named member lost their transcript too, and a user could rename
             # themselves to someone else's name and erase that person's lines.
             _me_uid = u.effective_user.id
-            CHAT_LOG[_cid] = deque((i, w, t) for (i, w, t) in _q if i != _me_uid)
+            # deque(maxlen=...) again: rebuilding it without maxlen made this chat's
+            # transcript grow without limit for the rest of the process.
+            CHAT_LOG[_cid] = deque(((i, w, t) for (i, w, t) in _q if i != _me_uid),
+                                   maxlen=getattr(_q, "maxlen", None))
     # The members roster is a second user-keyed store - erase the person there too.
     try:
         _removed = False
@@ -5590,7 +5639,6 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
         for _chunk in split_text(_idc):
             await _safe_send(u, c, md_to_html(_chunk), _chunk)
         return
-    _turn_begin(chat_id)          # cap the model calls this ONE message may spend
     is_private = u.effective_chat.type == "private"
     _first_media = (media[0] if isinstance(media, list) and media else media)
     was_audio = bool(isinstance(_first_media, dict)
@@ -5655,6 +5703,9 @@ async def _answer(u: Update, c: ContextTypes.DEFAULT_TYPE, text: str, media=None
     log.info("effort=%s for chat %s (%s)", effort, chat_id, (text or "")[:60])
 
     async with turn_lock(chat_id, getattr(u.effective_user, "id", 0)):
+        # Opened INSIDE the lock: two messages arriving together in one chat used to reset
+        # each other's budget, letting a single turn spend twice the model calls.
+        _turn_begin(chat_id)      # cap the model calls this ONE message may spend
         stop_evt = asyncio.Event()
         typing_task = asyncio.create_task(_typing_loop(c.bot, chat_id, stop_evt))
         progress = _Progress(c.bot, chat_id, _progress_text(lang, text))
@@ -6291,6 +6342,14 @@ async def on_button(u: Update, c: ContextTypes.DEFAULT_TYPE) -> None:
         await q.edit_message_text(await _info_text(u, c), parse_mode="Markdown",
                                   reply_markup=back_menu())
     elif d == "clear":
+        _chat = q.message.chat
+        _private = getattr(_chat, "type", "private") == "private"
+        _allowed = (_private or is_owner(q.from_user)
+                    or await _is_admin(c.bot, _chat, q.from_user.id))
+        if not _allowed:
+            await q.edit_message_text(
+                "Only an admin can clear this chat's memory.", reply_markup=back_menu())
+            return
         CHAT_LOG.pop(q.message.chat_id, None)
         await q.edit_message_text("🧹 Chat memory cleared.", reply_markup=back_menu())
     else:
@@ -6636,8 +6695,30 @@ async def _stash_link_image(chat_id, url: str, label: str = "") -> bool:
         log.info("refusing a non-public link image: %s", url[:70])
         return False
     try:
-        r = await HTTP.get(url, headers={"User-Agent": _UA_WEB}, timeout=12)
-        if r.status_code != 200:
+        # The structural check above cannot see where a NAME points, and og:image /
+        # thumbnail_url are chosen by whoever wrote the page. Resolve first, then follow
+        # redirects ourselves so every hop is validated too (the shared client follows
+        # redirects by default, which would carry this fetch into a private address).
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+        if not host or not await _host_is_public(host):
+            log.info("refusing a link image on a non-public host: %s", host[:60])
+            return False
+        cur, r = url, None
+        for _hop in range(4):
+            r = await HTTP.get(cur, headers={"User-Agent": _UA_WEB}, timeout=12,
+                               follow_redirects=False)
+            loc = r.headers.get("location") if r.status_code in (301, 302, 303, 307, 308) else ""
+            if not loc:
+                break
+            cur = urllib.parse.urljoin(cur, loc)
+            if not _url_is_public(cur):
+                log.info("refusing a redirect to a non-public link image: %s", cur[:70])
+                return False
+            nhost = (urllib.parse.urlparse(cur).hostname or "").lower()
+            if not nhost or not await _host_is_public(nhost):
+                log.info("refusing a redirect to a non-public host: %s", nhost[:60])
+                return False
+        if r is None or r.status_code != 200:
             return False
         data = r.content or b""
         if not data or len(data) > LINK_IMG_BYTES:
@@ -7312,6 +7393,11 @@ def _parse_reddit_rss(xml: str) -> str:
     entries = re.findall(r"<entry>(.*?)</entry>", xml, re.S)
     if not entries:
         return ""
+    def _reddit_user(name: str) -> str:
+        """Strip ONE leading "/u/" or "u/". str.lstrip("u/") removed every leading u and /,
+        so "/u/unknown_user" was reported as "nknown_user"."""
+        return re.sub(r"^/?(?:u/)?", "", (name or "").strip()).lstrip("/") or "?"
+
     def _field(chunk, tag):
         m = re.search(rf"<{tag}[^>]*>(.*?)</{tag}>", chunk, re.S)
         return html.unescape(re.sub(r"<[^>]+>", " ", m.group(1) or "")).strip() if m else ""
@@ -7323,15 +7409,15 @@ def _parse_reddit_rss(xml: str) -> str:
     if title:
         out.append("title: " + title[:300])
     if author:
-        out.append("author: u/" + author.lstrip("u/"))
+        out.append("author: u/" + _reddit_user(author))
     if body:
         out.append("post: " + body)
     comments = []
     for chunk in entries[1:8]:
-        who = _field(chunk, "name") or "?"
+        who = _reddit_user(_field(chunk, "name") or "?")
         txt = _clean(_field(chunk, "content"), 300)
         if txt:
-            comments.append(f"- u/{who.lstrip('u/')}: {txt}")
+            comments.append(f"- u/{who}: {txt}")
     if comments:
         out.append("top comments:\n" + "\n".join(comments))
     return "\n".join(out)
