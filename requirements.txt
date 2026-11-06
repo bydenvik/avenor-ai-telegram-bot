@@ -2,11 +2,15 @@ python-telegram-bot[rate-limiter]>=22.8,<28
 google-genai>=2.25
 httpx>=0.27
 python-dotenv>=1.0
-# Discord support (leave it in: it is only imported when DISCORD_TOKEN is set)
-discord.py>=1.5
-# Voice channels in Discord need this
-# PyNaCl>=2.4
+# Discord support. The code needs discord.py 2.x: app_commands / CommandTree, Intents and
+# tree.error do not exist in 1.x. ">=1.5" would let a resolver pick 1.7.3 and the bot would
+# crash on startup, so the floor is pinned to 2.4 and capped below 3.
+discord.py>=2.4,<3
+# Voice channels in Discord need this (audio encryption). 2.x does not exist - the newest
+# release is 1.6.x, so "PyNaCl>=2.4" made `pip install -r requirements.txt` fail outright.
+PyNaCl>=1.5,<2
 tzdata
 imageio-ffmpeg>=0.4.9
-# Optional: syntax-checks generated .yaml files before they are sent
-# pyyaml>=6.0
+# Syntax-checks generated .yaml files before they are sent. Without it that check is
+# silently skipped, so the same commit behaves differently on two hosts.
+pyyaml>=6

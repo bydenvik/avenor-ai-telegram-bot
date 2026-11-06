@@ -6696,6 +6696,8 @@ async def _check_reminders_once(bot=None) -> int:
         return 0
     sent = 0
     for r in MEM.due_reminders():
+        if _is_discord_chat(r.get("chat_id") or 0):
+            continue                   # a Discord reminder; that service delivers it
         rid = r.get("id")
         tries = int(r.get("tries", 0) or 0)
         try:
@@ -8911,35 +8913,189 @@ def _discord_ctx(channel_name: str, guild_name: str) -> str:
               "under 1500 characters." + (f" {hint}" if hint else ""))
 
 
+_DISCORD_BASE = 10 ** 15       # Discord pseudo chat ids live from here down; Telegram tops out ~1e13
+DISCORD_CHANNELS = {c.strip().lower().lstrip("#")
+                    for c in os.environ.get("DISCORD_CHANNELS", "").split(",") if c.strip()}
+if not DISCORD_CHANNELS:
+    # Sensible default: the AI channels this bot documents (they steer the answer via
+    # DISCORD_CHANNEL_HINTS) plus #general. Everywhere else it answers only when @mentioned,
+    # so it never wanders into #admin-room, #rules or #mod-log. Override with
+    # DISCORD_CHANNELS="ai-chat,general" (names or ids, comma separated).
+    DISCORD_CHANNELS = set(DISCORD_CHANNEL_HINTS) | {"general", "ai-chat"}
+DISCORD_COOLDOWN = float(os.environ.get("DISCORD_COOLDOWN", "2") or "2")
+DISCORD_MAX_PER_MIN = int(os.environ.get("DISCORD_MAX_PER_MIN", "12") or "12")
+_DISCORD_LAST: dict = {}       # channel id -> last answer time
+_DISCORD_HITS: dict = {}       # channel id -> deque of answer times (60s window)
+_DISCORD_REMINDERS_STARTED = False
+_DISC_IMG_EXT = {"png", "jpg", "jpeg", "webp", "gif", "bmp"}
+_DISC_AUD_EXT = {"ogg", "oga", "mp3", "wav", "m4a", "opus", "flac", "aac"}
+_DISC_OFFICE_EXT = {"docx", "xlsx", "pptx"}
+_DISC_TEXT_EXT = {"txt", "md", "csv", "json", "py", "js", "ts", "html", "css", "xml",
+                  "yml", "yaml", "log"}
+
+
 def _discord_chat_id(channel_id) -> int:
     """A stable pseudo chat id for ONE Discord channel.
 
-    Every Discord message used to be sent as `chat_id 0`, so the transcript, the per-turn
-    model budget and the per-chat action limits were all bypassed and the bot forgot the
-    previous line. Negative keeps it out of Telegram's id space.
+    Telegram chat ids top out around 1e13, so Discord ids start at 1e15 and the two worlds
+    never mix in the transcript, the turn budget or the reminder store. (Before this, every
+    Discord message used chat_id 0: no memory, no budget, no limits.)
     """
     try:
-        return -(abs(int(channel_id)) % 10 ** 12)
+        return -(_DISCORD_BASE + abs(int(channel_id)) % 10 ** 12)
     except (TypeError, ValueError):
         return 0
 
 
+def _is_discord_chat(chat_id) -> bool:
+    """True when a stored chat id belongs to Discord, so Telegram never tries to deliver it."""
+    try:
+        return int(chat_id) <= -_DISCORD_BASE
+    except (TypeError, ValueError):
+        return False
+
+
+def _discord_channel_of(chat_id) -> int:
+    try:
+        return abs(int(chat_id)) - _DISCORD_BASE
+    except (TypeError, ValueError):
+        return 0
+
+
+def _discord_channel_allowed(channel) -> bool:
+    """DISCORD_CHANNELS empty = every channel the bot can read."""
+    if not DISCORD_CHANNELS:
+        return True
+    name = (getattr(channel, "name", "") or "").lower().lstrip("#")
+    cid = str(getattr(channel, "id", "") or "")
+    return name in DISCORD_CHANNELS or cid in DISCORD_CHANNELS
+
+
+def _discord_rate_ok(channel_id) -> bool:
+    """Anti-loop guard: a short cooldown plus a per-channel answers-per-minute cap.
+
+    Without this, answering every message in a channel can spiral (two bots, an edit storm)
+    and burn the free model quota in minutes.
+    """
+    now = time.time()
+    if now - _DISCORD_LAST.get(channel_id, 0.0) < DISCORD_COOLDOWN:
+        return False
+    dq = _DISCORD_HITS.setdefault(channel_id, deque())
+    while dq and now - dq[0] > 60:
+        dq.popleft()
+    if len(dq) >= DISCORD_MAX_PER_MIN:
+        log.info("discord: channel %s hit %s answers/min - staying quiet", channel_id,
+                 DISCORD_MAX_PER_MIN)
+        return False
+    _DISCORD_LAST[channel_id] = now
+    dq.append(now)
+    return True
+
+
+def _discord_media_kind(name: str, ctype: str) -> str:
+    ext = (name.rsplit(".", 1)[-1] if "." in (name or "") else "").lower()
+    ctype = (ctype or "").lower()
+    if ctype.startswith("image/") or ext in _DISC_IMG_EXT:
+        return "image"
+    if ctype.startswith("audio/") or ext in _DISC_AUD_EXT:
+        return "audio"
+    if ctype.startswith("video/"):
+        return "video"
+    if ext == "pdf" or ctype == "application/pdf":
+        return "pdf"
+    if ext in _DISC_OFFICE_EXT:
+        return "office"
+    if ext in _DISC_TEXT_EXT or ctype.startswith("text/"):
+        return "text"
+    return ""
+
+
+async def _discord_prepare_media(message):
+    """First attachment -> (image, audio, doc, state, transcript), same rules as Telegram."""
+    atts = list(getattr(message, "attachments", None) or [])
+    if not atts:
+        return None, None, None, "none", ""
+    a = atts[0]
+    name = getattr(a, "filename", "") or "file"
+    mime = (getattr(a, "content_type", None) or "").split(";")[0].strip()
+    kind = _discord_media_kind(name, mime)
+    if not kind:
+        return None, None, None, "unsupported", ""
+    limit = (MAX_IMAGE_BYTES if kind == "image" else
+             MAX_AUDIO_BYTES if kind in ("audio", "video") else MAX_DOC_BYTES)
+    size = int(getattr(a, "size", 0) or 0)
+    if size and size > limit:
+        return None, None, None, "too_big", ""
+    try:
+        r = await HTTP.get(a.url, timeout=45)
+        if r.status_code != 200:
+            return None, None, None, "failed", ""
+        data = r.content or b""
+    except Exception as e:  # noqa: BLE001
+        log.info("discord: attachment fetch failed (%s)", str(e)[:100])
+        return None, None, None, "failed", ""
+    if not data:
+        return None, None, None, "failed", ""
+    if len(data) > limit:
+        return None, None, None, "too_big", ""
+    if kind == "image":
+        return (data, mime or "image/jpeg"), None, None, "image_loaded", ""
+    if kind in ("audio", "video"):
+        transcript = await transcribe_groq(data, name, mime or "audio/ogg")
+        if transcript:
+            return None, None, None, "audio_transcribed", transcript
+        return None, (data, mime or "audio/ogg"), None, "audio_direct", ""
+    if kind == "pdf":
+        return None, None, (data, "application/pdf"), "doc_loaded", ""
+    if kind == "office":
+        txt = await asyncio.to_thread(office_to_text, data)
+        if txt:
+            return None, None, (txt.encode("utf-8")[:20000], "text/plain"), "doc_loaded", ""
+        return None, None, None, "failed", ""
+    txt = data.decode("utf-8", "ignore")[:20000]
+    if not txt.strip():
+        return None, None, None, "failed", ""
+    return None, None, (txt.encode("utf-8"), "text/plain"), "doc_loaded", ""
+
+
+async def _discord_send_voice(channel, text: str) -> bool:
+    """Send the answer as a real voice note (ogg/opus) - the Discord twin of Telegram TTS."""
+    try:
+        import discord
+    except ImportError:
+        return False
+    try:
+        wav, _model = await tts_wav((text or "")[:TTS_MAX_CHARS], "english")
+        if not wav:
+            return False
+        ogg = await wav_to_ogg_opus(wav)
+        if not ogg:
+            return False
+        await channel.send(file=discord.File(io.BytesIO(ogg), filename="avenor_voice.ogg"))
+        return True
+    except Exception as e:  # noqa: BLE001
+        log.warning("discord: voice note failed (%s)", str(e)[:120])
+        return False
+
+
 async def _discord_answer(text: str, channel_name: str, guild_name: str,
-                          chat_id: int = 0, speaker: str = "someone") -> str:
-    """One answer, through the same model chain (and the same transcript) Telegram uses."""
+                          chat_id: int = 0, speaker: str = "someone",
+                          image=None, audio=None, doc=None, extra_ctx: str = "",
+                          user_id: int = 0) -> str:
+    """One answer, through the same model chain, transcript and budget Telegram uses."""
     text = (text or "").strip()
-    if not text:
+    if not text and not (image or audio or doc):
         return ""
     prompt = text[:2000]
     ctx = _discord_ctx(channel_name, guild_name)
+    if extra_ctx:
+        ctx += "\n\n" + extra_ctx
     if chat_id:
-        # Same shape as the Telegram path: the recent transcript IS the prompt, so
-        # "what did I just ask you?" works on Discord too.
-        log_line(chat_id, speaker, text)
+        log_line(chat_id, speaker, text or "(attached a file)", int(user_id or -1))
         prompt = recent_chat_block(chat_id, speaker)
         _turn_begin(chat_id)          # the per-message model budget Telegram already has
     try:
-        ans = await ask_gemini(chat_id, prompt, _guard(ctx))
+        ans = await ask_gemini(chat_id, prompt, _guard(ctx), image, audio, doc)
     except Exception as e:  # noqa: BLE001
         log.warning("discord: model call failed: %s", str(e)[:150])
         return "I could not reach the model just now - try again in a minute."
@@ -8952,6 +9108,46 @@ async def _discord_answer(text: str, channel_name: str, guild_name: str,
     if chat_id:
         log_line(chat_id, "Avenor", out, 0)
     return out[:1900]
+
+
+async def _discord_check_reminders(client) -> int:
+    """Deliver the reminders that belong to Discord (Telegram ones are left alone)."""
+    if MEM is None:
+        return 0
+    sent = 0
+    for r in MEM.due_reminders():
+        if not _is_discord_chat(r.get("chat_id") or 0):
+            continue
+        rid = r.get("id")
+        tries = int(r.get("tries", 0) or 0)
+        try:
+            cid = _discord_channel_of(r.get("chat_id") or 0)
+            ch = client.get_channel(cid) or await client.fetch_channel(cid)
+            if ch is None:
+                raise RuntimeError("channel not found")
+            await ch.send(f"⏰ Reminder: {r.get('text')}")
+        except Exception as e:  # noqa: BLE001
+            log.warning("discord: reminder %s send failed (attempt %s): %s",
+                        rid, tries + 1, str(e)[:120])
+            if tries + 1 >= REMINDER_MAX_TRIES:
+                MEM.pop_reminder(rid)
+            else:
+                MEM.reschedule_reminder(
+                    rid, tries + 1,
+                    time.time() + min(REMINDER_MAX_BACKOFF, 60.0 * 2 ** (tries + 1)))
+            continue
+        MEM.pop_reminder(rid)
+        sent += 1
+    return sent
+
+
+async def _discord_reminder_loop(client) -> None:
+    while True:
+        await asyncio.sleep(REMINDER_CHECK)
+        try:
+            await _discord_check_reminders(client)
+        except Exception as e:  # noqa: BLE001
+            log.warning("discord: reminder loop failed (%s)", str(e)[:120])
 
 
 async def _discord_runner() -> None:
@@ -8973,6 +9169,7 @@ async def _discord_runner() -> None:
 
     @client.event
     async def on_ready():  # noqa: ANN202
+        global _DISCORD_REMINDERS_STARTED
         _DISCORD_STATE["ready"] = True
         _DISCORD_STATE["guilds"] = len(client.guilds)
         _DISCORD_STATE["channels"] = sum(len(g.text_channels) for g in client.guilds)
@@ -8988,6 +9185,9 @@ async def _discord_runner() -> None:
                       "Invite it with BOTH scopes: https://discord.com/oauth2/authorize?"
                       "client_id=<APPLICATION_ID>&permissions=311388654656"
                       "&scope=bot%%20applications.commands")
+        if not _DISCORD_REMINDERS_STARTED:
+            _DISCORD_REMINDERS_STARTED = True
+            asyncio.create_task(_discord_reminder_loop(client))
         try:
             if DISCORD_GUILD_ID:
                 # copy_global_to() only fills the guild's command list. sync() WITHOUT the
@@ -9010,38 +9210,58 @@ async def _discord_runner() -> None:
         try:
             if message.author.bot or client.user is None:
                 return
-            # Compare by id: `client.user in message.mentions` depends on discord.py's
-            # equality between ClientUser and Member, which the stub test showed is not
-            # guaranteed.
-            mentioned = any(getattr(m, 'id', 0) == client.user.id
-                            for m in message.mentions)
+            channel = message.channel
             is_dm = message.guild is None
-            if not (is_dm or mentioned):
-                return
-            if not is_dm and not DISCORD_ANSWER_IN_CHANNELS:
-                return
+            mentioned = any(getattr(m, "id", 0) == client.user.id
+                            for m in message.mentions)
+            if not is_dm:
+                if not DISCORD_ANSWER_IN_CHANNELS:
+                    return
+                # A channel in DISCORD_CHANNELS answers every message; anywhere else the bot
+                # waits to be @mentioned, so it never butts into unrelated chatter.
+                if not mentioned and not _discord_channel_allowed(channel):
+                    return
+                if not _discord_rate_ok(getattr(channel, "id", 0)):
+                    return
             text = message.content or ""
             if mentioned:
                 text = text.replace(f"<@{client.user.id}>", "").replace(
                     f"<@!{client.user.id}>", "").strip()
-            # An attachment-only message produced empty text and a silent drop, so the person
-            # saw nothing at all and assumed the bot was broken. Say so instead.
-            if not text.strip():
-                if message.attachments:
-                    await message.reply(
-                        "I can't open files or images on Discord yet - send them to me on "
-                        "Telegram and I'll read them there.",
-                        mention_author=False)
+            image, audio, doc, mstate, transcript = await _discord_prepare_media(message)
+            if mstate == "unsupported":
+                await message.reply("I can't open that file type. Send text, a PDF, an image, "
+                                    "an audio clip or an Office file.", mention_author=False)
                 return
+            if mstate == "too_big":
+                await message.reply("That file is too large for me to open.", mention_author=False)
+                return
+            if transcript and not text.strip():
+                text = transcript
+            if not text.strip() and not (image or audio or doc):
+                if getattr(message, "attachments", None):
+                    await message.reply("I could not read that attachment - try another file.",
+                                        mention_author=False)
+                return
+            if not text.strip():
+                text = ("Please look at the image I attached and tell me about it."
+                        if mstate.startswith("image")
+                        else "Please read the file I attached and answer about it.")
+            want_voice = _voice_requested(text)
+            if want_voice:
+                text = _strip_voice_trigger(text).strip() or "Say this out loud, briefly."
             guild_name = message.guild.name if message.guild else ""
-            _cid = _discord_chat_id(message.channel.id)
+            _cid = _discord_chat_id(channel.id)
             _speaker = getattr(message.author, "display_name", None) or "someone"
-            async with message.channel.typing():
-                out = await _discord_answer(text, getattr(message.channel, "name", ""),
-                                            guild_name, _cid, _speaker)
-            if out:
-                for chunk in [out[i:i + 1900] for i in range(0, len(out), 1900)]:
-                    await message.reply(chunk, mention_author=False)
+            async with channel.typing():
+                out = await _discord_answer(
+                    text, getattr(channel, "name", "") or "", guild_name, _cid, _speaker,
+                    image, audio, doc, user_id=getattr(message.author, "id", 0))
+            if not out:
+                return
+            if want_voice and await _discord_send_voice(channel, out):
+                return
+            for chunk in [out[i:i + 1900] for i in range(0, len(out), 1900)]:
+                await message.reply(chunk, mention_author=False)
         except Exception as e:  # noqa: BLE001
             _DISCORD_STATE["last_error"] = str(e)[:200]
             log.warning("discord: on_message failed: %s", str(e)[:150])
@@ -9051,11 +9271,107 @@ async def _discord_runner() -> None:
         await interaction.response.defer(thinking=True)
         _ch = interaction.channel
         out = await _discord_answer(
-            prompt, getattr(_ch, "name", ""),
+            prompt, getattr(_ch, "name", "") or "",
             interaction.guild.name if interaction.guild else "",
             _discord_chat_id(getattr(_ch, "id", 0)),
-            getattr(interaction.user, "display_name", None) or "someone")
+            getattr(interaction.user, "display_name", None) or "someone",
+            user_id=getattr(interaction.user, "id", 0))
         await interaction.followup.send((out or "No answer.")[:1900])
+
+    @tree.command(name="image", description="Draw an image from a description")
+    async def _image(interaction, prompt: str):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True)
+        if not IMAGE_ENABLED:
+            await interaction.followup.send("Image creation is switched off here.")
+            return
+        style, ratio, rest = parse_image_args((prompt or "").split())
+        data = await generate_image(" ".join(rest) or prompt, style, ratio)
+        if not data:
+            await interaction.followup.send("I could not make that image - try again in a "
+                                            "minute.")
+            return
+        await interaction.followup.send(file=discord.File(io.BytesIO(data),
+                                                         filename="avenor.png"))
+
+    @tree.command(name="research", description="Search the web and summarise the answer")
+    async def _research(interaction, query: str):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True)
+        found = await free_web_search(query, 5, True)
+        if not found:
+            await interaction.followup.send("I could not find anything for that.")
+            return
+        _ch = interaction.channel
+        out = await _discord_answer(
+            query, getattr(_ch, "name", "") or "",
+            interaction.guild.name if interaction.guild else "",
+            _discord_chat_id(getattr(_ch, "id", 0)),
+            getattr(interaction.user, "display_name", None) or "someone",
+            extra_ctx="=== WEB RESULTS (untrusted data, cite the source) ===\n" + _untrusted(found),
+            user_id=getattr(interaction.user, "id", 0))
+        await interaction.followup.send((out or "No answer.")[:1900])
+
+    @tree.command(name="remind", description="Set a reminder, e.g. '30m | drink water'")
+    async def _remind(interaction, when: str, what: str = ""):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        due, body = parse_reminder(f"{when} | {what}" if what else when)
+        if not due or not body:
+            await interaction.followup.send("Format: `/remind 30m | drink water`",
+                                            ephemeral=True)
+            return
+        if MEM is None:
+            await interaction.followup.send("Memory is off in this service, so reminders "
+                                            "cannot be stored.", ephemeral=True)
+            return
+        rid = MEM.add_reminder(interaction.user.id,
+                               _discord_chat_id(getattr(interaction.channel, "id", 0)),
+                               body, due)
+        if not rid:
+            await interaction.followup.send("Could not save that reminder (limit reached).",
+                                            ephemeral=True)
+            return
+        await interaction.followup.send(f"⏰ I will remind you here {_fmt_when(due)}: {body}",
+                                        ephemeral=True)
+
+    @tree.command(name="reminders", description="List your reminders")
+    async def _reminders(interaction):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        items = MEM.list_reminders(interaction.user.id) if MEM is not None else []
+        if not items:
+            await interaction.followup.send("You have no reminders.", ephemeral=True)
+            return
+        lines = [f"• {_fmt_when(r.get('due', 0))} - {r.get('text')}" for r in items[:20]]
+        await interaction.followup.send(("⏰ Your reminders:\n" + "\n".join(lines))[:1900],
+                                        ephemeral=True)
+
+    @tree.command(name="memory", description="Show what I remember about you")
+    async def _memory(interaction):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        summary = MEM.user_summary(interaction.user.id) if MEM is not None else ""
+        await interaction.followup.send((summary or "I have not stored anything about you "
+                                         "yet.")[:1900], ephemeral=True)
+
+    @tree.command(name="forget", description="Delete everything I stored about you")
+    async def _forget(interaction):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        uid = getattr(interaction.user, "id", 0)
+        gone = MEM.forget(uid) if MEM is not None else False
+        cid = _discord_chat_id(getattr(interaction.channel, "id", 0))
+        q = CHAT_LOG.get(cid)
+        if q:
+            CHAT_LOG[cid] = deque(((i, w, t) for (i, w, t) in q if i != uid),
+                                  maxlen=getattr(q, "maxlen", None))
+        await interaction.followup.send(
+            "🗑️ Done - your notes and reminders are deleted." if gone
+            else "There was nothing stored about you.", ephemeral=True)
+
+    @tree.command(name="id", description="Show your ids (for OWNER_IDS)")
+    async def _id(interaction):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        await interaction.followup.send(
+            f"Your user id: `{getattr(interaction.user, 'id', 0)}`\n"
+            f"Channel id: `{getattr(interaction.channel, 'id', 0)}`\n"
+            f"Server id: `{getattr(getattr(interaction, 'guild', None), 'id', 0)}`",
+            ephemeral=True)
 
     @tree.command(name="channels", description="List this server's channels and voice rooms")
     async def _channels(interaction):  # noqa: ANN001, ANN202
