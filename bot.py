@@ -8886,7 +8886,8 @@ DISCORD_ENABLED = bool(DISCORD_TOKEN) and RUN_DISCORD
 DISCORD_VC = os.environ.get("DISCORD_VC", "false").strip().lower() in ("1", "true", "yes", "on")
 DISCORD_ANSWER_IN_CHANNELS = os.environ.get("DISCORD_ANSWER_IN_CHANNELS", "true").strip().lower() \
     in ("1", "true", "yes", "on")
-_DISCORD_STATE = {"ready": False, "guilds": 0, "channels": 0, "voice": 0, "last_error": ""}
+_DISCORD_STATE = {"ready": False, "guilds": 0, "channels": 0, "voice": 0, "last_error": "",
+                  "last_skip": ""}
 _BOOT_AT = time.time()
 _LAST_BOOT_ERROR = ""
 
@@ -8914,14 +8915,18 @@ def _discord_ctx(channel_name: str, guild_name: str) -> str:
 
 
 _DISCORD_BASE = 10 ** 15       # Discord pseudo chat ids live from here down; Telegram tops out ~1e13
+# Answering policy, simplest first:
+#   DISCORD_CHANNELS unset -> answer EVERY message in every channel the bot can read, except
+#                             the housekeeping channels below. That is what "works like
+#                             Telegram" means, and it needs no configuration at all.
+#   DISCORD_CHANNELS set   -> answer only in those channels (names or ids).
 DISCORD_CHANNELS = {c.strip().lower().lstrip("#")
                     for c in os.environ.get("DISCORD_CHANNELS", "").split(",") if c.strip()}
-if not DISCORD_CHANNELS:
-    # Sensible default: the AI channels this bot documents (they steer the answer via
-    # DISCORD_CHANNEL_HINTS) plus #general. Everywhere else it answers only when @mentioned,
-    # so it never wanders into #admin-room, #rules or #mod-log. Override with
-    # DISCORD_CHANNELS="ai-chat,general" (names or ids, comma separated).
-    DISCORD_CHANNELS = set(DISCORD_CHANNEL_HINTS) | {"general", "ai-chat"}
+DISCORD_IGNORE_CHANNELS = {c.strip().lower().lstrip("#")
+                           for c in os.environ.get(
+                               "DISCORD_IGNORE_CHANNELS",
+                               "admin,admin-room,mod-log,bot-logs,logs,rules,welcome,"
+                               "announcements,voice-control").split(",") if c.strip()}
 DISCORD_COOLDOWN = float(os.environ.get("DISCORD_COOLDOWN", "2") or "2")
 DISCORD_MAX_PER_MIN = int(os.environ.get("DISCORD_MAX_PER_MIN", "12") or "12")
 _DISCORD_LAST: dict = {}       # channel id -> last answer time
@@ -8963,12 +8968,44 @@ def _discord_channel_of(chat_id) -> int:
 
 
 def _discord_channel_allowed(channel) -> bool:
-    """DISCORD_CHANNELS empty = every channel the bot can read."""
-    if not DISCORD_CHANNELS:
-        return True
+    """Should the bot answer here without being @mentioned?
+
+    An explicit DISCORD_CHANNELS list wins; otherwise every channel answers except the
+    housekeeping ones (admin/mod/log/rules), where it still answers when mentioned.
+    """
     name = (getattr(channel, "name", "") or "").lower().lstrip("#")
     cid = str(getattr(channel, "id", "") or "")
-    return name in DISCORD_CHANNELS or cid in DISCORD_CHANNELS
+    if DISCORD_CHANNELS:
+        return name in DISCORD_CHANNELS or cid in DISCORD_CHANNELS
+    return name not in DISCORD_IGNORE_CHANNELS
+
+
+def _discord_gate(message, bot_user) -> tuple:
+    """(should_answer, reason) - the whole decision, testable without a gateway.
+
+    Every skip is named, so the reason appears in the log and in /why instead of the bot
+    going quiet for no visible cause.
+    """
+    if message is None:
+        return False, "no message object"
+    author = getattr(message, "author", None)
+    if author is None:
+        return False, "no author"
+    if getattr(author, "bot", False):
+        return False, "sent by a bot or webhook"
+    if bot_user is None:
+        return False, "the bot is not logged in yet"
+    channel = getattr(message, "channel", None)
+    mentioned = any(getattr(m, "id", 0) == getattr(bot_user, "id", 0)
+                    for m in (getattr(message, "mentions", None) or []))
+    if getattr(message, "guild", None) is not None:
+        if not DISCORD_ANSWER_IN_CHANNELS:
+            return False, "DISCORD_ANSWER_IN_CHANNELS=false"
+        if not mentioned and not _discord_channel_allowed(channel):
+            return False, f"#{getattr(channel, 'name', '?')} is a no-answer channel"
+        if not _discord_rate_ok(getattr(channel, "id", 0)):
+            return False, "rate limited (cooldown or per-minute cap)"
+    return True, "ok"
 
 
 def _discord_rate_ok(channel_id) -> bool:
@@ -9150,6 +9187,84 @@ async def _discord_reminder_loop(client) -> None:
             log.warning("discord: reminder loop failed (%s)", str(e)[:120])
 
 
+async def _discord_handle_message(message, client, discord) -> None:
+    """The whole per-message flow, kept outside the event closure so it can be
+    driven by a test with fake discord objects."""
+    should, why = _discord_gate(message, client.user)
+    if not should:
+        _DISCORD_STATE["last_skip"] = why
+        log.info("discord: not answering in #%s - %s",
+                 getattr(getattr(message, "channel", None), "name", "dm"), why)
+        return
+    channel = message.channel
+    mentioned = any(getattr(m, "id", 0) == client.user.id
+                    for m in (message.mentions or []))
+    text = message.content or ""
+    if mentioned:
+        text = text.replace(f"<@{client.user.id}>", "").replace(
+            f"<@!{client.user.id}>", "").strip()
+    image, audio, doc, mstate, transcript = await _discord_prepare_media(message)
+    if mstate == "unsupported":
+        await message.reply("I can't open that file type. Send text, a PDF, an image, "
+                            "an audio clip or an Office file.", mention_author=False)
+        return
+    if mstate == "too_big":
+        await message.reply("That file is too large for me to open.", mention_author=False)
+        return
+    if transcript and not text.strip():
+        text = transcript
+    if not text.strip() and not (image or audio or doc):
+        if getattr(message, "attachments", None):
+            await message.reply("I could not read that attachment - try another file.",
+                                mention_author=False)
+        else:
+            # The gateway delivered the event with NO text: the Message Content intent is
+            # not in force on this connection (it is requested at connect time, so enabling
+            # it in the portal needs a RESTART). This used to return silently - which looks
+            # exactly like "the bot is dead in channels but /ask still works".
+            _DISCORD_STATE["last_skip"] = "empty content (Message Content intent)"
+            log.warning("discord: message with EMPTY text from %s in #%s - the Message "
+                        "Content intent is not active on this connection. Enable it in the "
+                        "Developer Portal, then RESTART the service.",
+                        getattr(getattr(message, "author", None), "display_name", "?"),
+                        getattr(channel, "name", "dm"))
+        return
+    if not text.strip():
+        text = ("Please look at the image I attached and tell me about it."
+                if mstate.startswith("image")
+                else "Please read the file I attached and answer about it.")
+    want_voice = _voice_requested(text)
+    if want_voice:
+        text = _strip_voice_trigger(text).strip() or "Say this out loud, briefly."
+    guild_name = message.guild.name if message.guild else ""
+    _cid = _discord_chat_id(channel.id)
+    _speaker = getattr(message.author, "display_name", None) or "someone"
+    # A typing indicator needs Send Messages; if it fails the answer must still go out.
+    _typing = channel.typing()
+    try:
+        await _typing.__aenter__()
+        _typing_on = True
+    except Exception as e:  # noqa: BLE001
+        _typing_on = False
+        log.debug("discord: typing indicator failed (%s)", str(e)[:100])
+    try:
+        out = await _discord_answer(
+            text, getattr(channel, "name", "") or "", guild_name, _cid, _speaker,
+            image, audio, doc, user_id=getattr(message.author, "id", 0))
+    finally:
+        if _typing_on:
+            try:
+                await _typing.__aexit__(None, None, None)
+            except Exception:  # noqa: BLE001
+                pass
+    if not out:
+        return
+    if want_voice and await _discord_send_voice(channel, out):
+        return
+    for chunk in [out[i:i + 1900] for i in range(0, len(out), 1900)]:
+        await message.reply(chunk, mention_author=False)
+
+
 async def _discord_runner() -> None:
     """Start the Discord client. Every failure is caught: Telegram must never notice."""
     if not DISCORD_ENABLED:
@@ -9208,60 +9323,7 @@ async def _discord_runner() -> None:
     @client.event
     async def on_message(message):  # noqa: ANN202
         try:
-            if message.author.bot or client.user is None:
-                return
-            channel = message.channel
-            is_dm = message.guild is None
-            mentioned = any(getattr(m, "id", 0) == client.user.id
-                            for m in message.mentions)
-            if not is_dm:
-                if not DISCORD_ANSWER_IN_CHANNELS:
-                    return
-                # A channel in DISCORD_CHANNELS answers every message; anywhere else the bot
-                # waits to be @mentioned, so it never butts into unrelated chatter.
-                if not mentioned and not _discord_channel_allowed(channel):
-                    return
-                if not _discord_rate_ok(getattr(channel, "id", 0)):
-                    return
-            text = message.content or ""
-            if mentioned:
-                text = text.replace(f"<@{client.user.id}>", "").replace(
-                    f"<@!{client.user.id}>", "").strip()
-            image, audio, doc, mstate, transcript = await _discord_prepare_media(message)
-            if mstate == "unsupported":
-                await message.reply("I can't open that file type. Send text, a PDF, an image, "
-                                    "an audio clip or an Office file.", mention_author=False)
-                return
-            if mstate == "too_big":
-                await message.reply("That file is too large for me to open.", mention_author=False)
-                return
-            if transcript and not text.strip():
-                text = transcript
-            if not text.strip() and not (image or audio or doc):
-                if getattr(message, "attachments", None):
-                    await message.reply("I could not read that attachment - try another file.",
-                                        mention_author=False)
-                return
-            if not text.strip():
-                text = ("Please look at the image I attached and tell me about it."
-                        if mstate.startswith("image")
-                        else "Please read the file I attached and answer about it.")
-            want_voice = _voice_requested(text)
-            if want_voice:
-                text = _strip_voice_trigger(text).strip() or "Say this out loud, briefly."
-            guild_name = message.guild.name if message.guild else ""
-            _cid = _discord_chat_id(channel.id)
-            _speaker = getattr(message.author, "display_name", None) or "someone"
-            async with channel.typing():
-                out = await _discord_answer(
-                    text, getattr(channel, "name", "") or "", guild_name, _cid, _speaker,
-                    image, audio, doc, user_id=getattr(message.author, "id", 0))
-            if not out:
-                return
-            if want_voice and await _discord_send_voice(channel, out):
-                return
-            for chunk in [out[i:i + 1900] for i in range(0, len(out), 1900)]:
-                await message.reply(chunk, mention_author=False)
+            await _discord_handle_message(message, client, discord)
         except Exception as e:  # noqa: BLE001
             _DISCORD_STATE["last_error"] = str(e)[:200]
             log.warning("discord: on_message failed: %s", str(e)[:150])
@@ -9389,6 +9451,24 @@ async def _discord_runner() -> None:
                 lines.append(f"  - #{ch.name} ({kind})")
         await interaction.response.send_message(
             ("\n".join(lines) or "I am not in any server yet.")[:1900], ephemeral=True)
+
+    @tree.command(name="why", description="Why did the bot answer, or not answer, here?")
+    async def _why(interaction):  # noqa: ANN001, ANN202
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        ch = interaction.channel
+        lines = [
+            f"channel: #{getattr(ch, 'name', '?')} (id {getattr(ch, 'id', 0)})",
+            f"answers here without a mention: {_discord_channel_allowed(ch)}",
+            "allowlist: " + (", ".join(sorted(DISCORD_CHANNELS)) if DISCORD_CHANNELS
+                             else "(none - every channel except the ignore list)"),
+            "ignore list: " + ", ".join(sorted(DISCORD_IGNORE_CHANNELS)),
+            f"DISCORD_ANSWER_IN_CHANNELS: {DISCORD_ANSWER_IN_CHANNELS}",
+            f"cooldown: {DISCORD_COOLDOWN}s | cap: {DISCORD_MAX_PER_MIN}/min",
+            f"servers: {_DISCORD_STATE['guilds']} | ready: {_DISCORD_STATE['ready']}",
+            f"last skip: {_DISCORD_STATE.get('last_skip') or '(none)'}",
+            f"last error: {_DISCORD_STATE.get('last_error') or '(none)'}",
+        ]
+        await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True)
 
     @tree.error
     async def _on_app_error(interaction, error):  # noqa: ANN001, ANN202
@@ -11504,6 +11584,15 @@ def main() -> None:
     if not DISCORD_ENABLED:
         log.info("Discord is OFF in this service (RUN_DISCORD=false or no DISCORD_TOKEN) - "
                  "Telegram is unaffected.")
+    elif not DISCORD_ANSWER_IN_CHANNELS:
+        log.warning("Discord will answer DMs and slash commands ONLY: "
+                    "DISCORD_ANSWER_IN_CHANNELS=false is set. Unset it (or set it to true) "
+                    "to answer normal channel messages.")
+    else:
+        log.info("Discord will answer channel messages in: %s",
+                 ", ".join("#" + c for c in sorted(DISCORD_CHANNELS)) if DISCORD_CHANNELS
+                 else "every channel except " + ", ".join("#" + c for c in
+                                                          sorted(DISCORD_IGNORE_CHANNELS)))
 
     # Never let a transient Telegram Conflict (deploy overlap / a second instance) kill
     # the bot: it used to crash-loop, and every message then got the "busy" reply.
